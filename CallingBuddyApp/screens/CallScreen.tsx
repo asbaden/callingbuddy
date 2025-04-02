@@ -1,39 +1,72 @@
 import React, { useState } from 'react';
-import { StyleSheet, Text, View, TouchableOpacity, TextInput, Alert, ActivityIndicator, Linking } from 'react-native';
+import { StyleSheet, Text, View, TouchableOpacity, TextInput, Alert, ActivityIndicator } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../App';
-import * as ExpoLinking from 'expo-linking';
-import { TWILIO_PHONE_NUMBER } from '../utils/config';
+import axios from 'axios';
+import { BACKEND_URL } from '../utils/config';
 
 type CallScreenNavigationProp = NativeStackNavigationProp<RootStackParamList, 'Call'>;
 
 export default function CallScreen() {
   const navigation = useNavigation<CallScreenNavigationProp>();
+  const [phoneNumber, setPhoneNumber] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  // Direct call to Twilio number
-  const callDirectly = async () => {
+  // Set a longer timeout for API calls
+  const axiosInstance = axios.create({
+    timeout: 60000  // 60 seconds timeout
+  });
+
+  const initiateCall = async () => {
+    // Simple validation
+    if (!phoneNumber || phoneNumber.length < 10) {
+      Alert.alert('Invalid Number', 'Please enter a valid phone number with country code (e.g., +1234567890)');
+      return;
+    }
+
     setIsLoading(true);
-    
+    setErrorMessage(null);
+
     try {
-      const telUrl = `tel:${TWILIO_PHONE_NUMBER}`;
-      const canOpen = await ExpoLinking.canOpenURL(telUrl);
+      console.log(`Making request to: ${BACKEND_URL}/call-user`);
       
-      if (canOpen) {
-        await ExpoLinking.openURL(telUrl);
-      } else {
-        Alert.alert(
-          'Cannot Make Call',
-          'Your device cannot make phone calls. Try using a physical device instead of a simulator.',
-          [{ text: 'OK' }]
-        );
+      // Request the Twilio service to call the user
+      const response = await axiosInstance.post(`${BACKEND_URL}/call-user`, {
+        to: phoneNumber,
+      });
+
+      console.log('Response:', response.data);
+      
+      Alert.alert(
+        'Call Initiated',
+        'You will receive a call from our AI assistant shortly.',
+        [{ text: 'OK' }]
+      );
+    } catch (error: any) {
+      console.error('Error initiating call:', error);
+      
+      // Get more detailed error information
+      let errorMsg = 'There was a problem initiating the call.';
+      
+      if (axios.isAxiosError(error)) {
+        if (error.code === 'ECONNABORTED') {
+          errorMsg = 'Request timed out. The server might be starting up. Please try again in a minute.';
+        } else {
+          errorMsg += ` Status: ${error.response?.status || 'unknown'}`;
+          errorMsg += ` Message: ${error.message}`;
+          if (error.response?.data) {
+            errorMsg += ` Details: ${JSON.stringify(error.response.data)}`;
+          }
+        }
       }
-    } catch (error) {
-      console.error('Error making direct call:', error);
+      
+      setErrorMessage(errorMsg);
+      
       Alert.alert(
         'Error',
-        'There was a problem making the call. Please try again.',
+        'There was a problem initiating the call. Please try again in a moment.',
         [{ text: 'OK' }]
       );
     } finally {
@@ -43,40 +76,55 @@ export default function CallScreen() {
 
   return (
     <View style={styles.container}>
-      <Text style={styles.title}>Call AI Assistant</Text>
+      <Text style={styles.title}>AI Assistant Calls You</Text>
       
       <View style={styles.infoCard}>
-        <Text style={styles.infoTitle}>How to use</Text>
+        <Text style={styles.infoTitle}>How it works</Text>
         <Text style={styles.infoText}>
-          Call our Twilio number directly to speak with our AI assistant powered by OpenAI's Realtime API.
+          Enter your phone number below and our AI assistant will call you directly.
         </Text>
         <Text style={styles.infoText}>
-          When connected, you can have a natural conversation with the AI, ask questions, or just chat!
+          When you answer, you can have a natural conversation with the AI, ask questions, or just chat!
         </Text>
       </View>
       
-      <View style={styles.phoneNumberContainer}>
-        <Text style={styles.phoneNumberLabel}>Call this number:</Text>
-        <Text style={styles.phoneNumber}>{TWILIO_PHONE_NUMBER}</Text>
+      <View style={styles.inputContainer}>
+        <Text style={styles.label}>Your Phone Number</Text>
+        <TextInput
+          style={styles.input}
+          placeholder="+1 (234) 567-8910"
+          keyboardType="phone-pad"
+          value={phoneNumber}
+          onChangeText={setPhoneNumber}
+          maxLength={15}
+        />
+        <Text style={styles.helpText}>Include country code (e.g., +1 for US)</Text>
       </View>
       
       <TouchableOpacity 
         style={styles.callButton}
-        onPress={callDirectly}
+        onPress={initiateCall}
         disabled={isLoading}
       >
         {isLoading ? (
           <ActivityIndicator color="#fff" />
         ) : (
-          <Text style={styles.callButtonText}>Call AI Assistant</Text>
+          <Text style={styles.callButtonText}>Request AI Call</Text>
         )}
       </TouchableOpacity>
       
+      {errorMessage && (
+        <View style={styles.errorContainer}>
+          <Text style={styles.errorTitle}>Error Details:</Text>
+          <Text style={styles.errorText}>{errorMessage}</Text>
+        </View>
+      )}
+
       <Text style={styles.noteSectionTitle}>Notes:</Text>
       <View style={styles.noteContainer}>
-        <Text style={styles.noteText}>• Works best on physical devices</Text>
-        <Text style={styles.noteText}>• Standard call rates may apply</Text>
         <Text style={styles.noteText}>• First response may take a few seconds</Text>
+        <Text style={styles.noteText}>• Our service may be slow to start (free tier)</Text>
+        <Text style={styles.noteText}>• If it fails, please try again in a minute</Text>
       </View>
     </View>
   );
@@ -118,26 +166,33 @@ const styles = StyleSheet.create({
     color: '#555',
     marginBottom: 10,
   },
-  phoneNumberContainer: {
-    alignItems: 'center',
+  inputContainer: {
     marginBottom: 25,
   },
-  phoneNumberLabel: {
+  label: {
     fontSize: 16,
-    color: '#555',
     marginBottom: 8,
+    color: '#555',
   },
-  phoneNumber: {
-    fontSize: 26,
-    fontWeight: 'bold',
-    color: '#3498db',
+  input: {
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: '#ddd',
+    borderRadius: 8,
+    padding: 12,
+    fontSize: 16,
+  },
+  helpText: {
+    fontSize: 12,
+    color: '#777',
+    marginTop: 4,
   },
   callButton: {
     backgroundColor: '#3498db',
     paddingVertical: 16,
     borderRadius: 10,
     alignItems: 'center',
-    marginBottom: 30,
+    marginBottom: 20,
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.1,
@@ -148,6 +203,23 @@ const styles = StyleSheet.create({
     color: 'white',
     fontSize: 18,
     fontWeight: '600',
+  },
+  errorContainer: {
+    backgroundColor: '#ffebee',
+    padding: 10,
+    borderRadius: 5,
+    marginBottom: 20,
+    borderWidth: 1,
+    borderColor: '#ffcdd2',
+  },
+  errorTitle: {
+    color: '#d32f2f',
+    fontWeight: 'bold',
+    marginBottom: 5,
+  },
+  errorText: {
+    color: '#d32f2f',
+    fontSize: 12,
   },
   noteSectionTitle: {
     fontSize: 16,
