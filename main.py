@@ -10,6 +10,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from twilio.twiml.voice_response import VoiceResponse, Connect, Say, Stream
 from twilio.rest import Client
 from dotenv import load_dotenv
+# Import Supabase functions
+from database.supabase_client import (
+    create_user, 
+    get_user_by_phone,
+    create_call,
+    update_call,
+    get_call_by_sid,
+    create_transcription
+)
 
 load_dotenv()
 
@@ -88,6 +97,14 @@ async def call_user(request: Request):
                 content={"error": "Twilio client not configured. Check your environment variables."}
             )
         
+        # Check if user exists, create if not
+        user = await get_user_by_phone(to_number)
+        if not user:
+            user = await create_user(phone_number=to_number)
+            
+        # Create a call record in the database
+        db_call = await create_call(user_id=user['id'], status="initiated")
+        
         # Create the URL for the TwiML that will be executed when the call connects
         callback_url = f"https://{request.url.hostname}/incoming-call"
         
@@ -99,9 +116,12 @@ async def call_user(request: Request):
             method="POST"
         )
         
+        # Update the call record with Twilio's call SID
+        await update_call(call_id=db_call['id'], call_sid=call.sid)
+        
         return JSONResponse(
             status_code=200,
-            content={"success": True, "message": "Call initiated", "call_sid": call.sid}
+            content={"success": True, "message": "Call initiated", "call_sid": call.sid, "call_id": db_call['id']}
         )
     except Exception as e:
         return JSONResponse(
@@ -114,6 +134,12 @@ async def handle_media_stream(websocket: WebSocket):
     """Handle WebSocket connections between Twilio and OpenAI."""
     print("Client connected")
     await websocket.accept()
+    
+    # Variables to track the call and collect transcription
+    stream_sid = None
+    call_record = None
+    full_transcription = []
+    
     async with websockets.connect(
         'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01',
         extra_headers={
@@ -122,10 +148,10 @@ async def handle_media_stream(websocket: WebSocket):
         }
     ) as openai_ws:
         await send_session_update(openai_ws)
-        stream_sid = None
+        
         async def receive_from_twilio():
             """Receive audio data from Twilio and send it to the OpenAI Realtime API."""
-            nonlocal stream_sid
+            nonlocal stream_sid, call_record
             try:
                 async for message in websocket.iter_text():
                     data = json.loads(message)
@@ -138,21 +164,48 @@ async def handle_media_stream(websocket: WebSocket):
                     elif data['event'] == 'start':
                         stream_sid = data['start']['streamSid']
                         print(f"Incoming stream has started {stream_sid}")
+                        
+                        # Try to find the call record based on the stream SID
+                        # This is a bit tricky since we don't have a direct mapping from stream_sid to call_sid
+                        # In a production app, you might want to pass additional parameters or use a different approach
             except WebSocketDisconnect:
                 print("Client disconnected.")
+                
+                # Save the transcription if we have collected any text
+                if call_record and full_transcription:
+                    try:
+                        await create_transcription(
+                            call_id=call_record['id'],
+                            content="\n".join(full_transcription)
+                        )
+                        # Update call status to completed
+                        await update_call(call_id=call_record['id'], status="completed")
+                    except Exception as e:
+                        print(f"Error saving transcription: {e}")
+                
                 if openai_ws.open:
                     await openai_ws.close()
 
         async def send_to_twilio():
             """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
-            nonlocal stream_sid
+            nonlocal stream_sid, full_transcription
             try:
                 async for openai_message in openai_ws:
                     response = json.loads(openai_message)
+                    
+                    # Log important events
                     if response['type'] in LOG_EVENT_TYPES:
                         print(f"Received event: {response['type']}", response)
+                    
+                    # Record transcribed text
+                    if response['type'] == 'response.content.part' and 'content' in response:
+                        full_transcription.append(f"AI: {response['content']}")
+                    elif response['type'] == 'input_audio_buffer.transcript' and 'transcript' in response:
+                        full_transcription.append(f"User: {response['transcript']}")
+                        
                     if response['type'] == 'session.updated':
                         print("Session updated successfully:", response)
+                        
                     if response['type'] == 'response.audio.delta' and response.get('delta'):
                         # Audio from OpenAI
                         try:
@@ -169,6 +222,16 @@ async def handle_media_stream(websocket: WebSocket):
                             print(f"Error processing audio data: {e}")
             except Exception as e:
                 print(f"Error in send_to_twilio: {e}")
+                
+                # Try to save any collected transcription before exiting
+                if call_record and full_transcription:
+                    try:
+                        await create_transcription(
+                            call_id=call_record['id'],
+                            content="\n".join(full_transcription)
+                        )
+                    except Exception as save_error:
+                        print(f"Error saving transcription on error: {save_error}")
 
         await asyncio.gather(receive_from_twilio(), send_to_twilio())
 
@@ -188,6 +251,28 @@ async def send_session_update(openai_ws):
     }
     print('Sending session update:', json.dumps(session_update))
     await openai_ws.send(json.dumps(session_update))
+
+# New endpoints for working with transcriptions
+@app.get("/calls/{call_id}/transcription")
+async def get_call_transcription(call_id: str):
+    """Get the transcription for a specific call."""
+    try:
+        transcription = await get_transcription_by_call_id(call_id)
+        if not transcription:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "Transcription not found for this call"}
+            )
+        
+        return JSONResponse(
+            status_code=200,
+            content=transcription
+        )
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Error retrieving transcription: {str(e)}"}
+        )
 
 if __name__ == "__main__":
     import uvicorn
