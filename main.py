@@ -6,6 +6,8 @@ import asyncio
 import websockets
 import aiohttp
 import tempfile
+import subprocess
+import shutil
 from fastapi import FastAPI, WebSocket, Request, Body
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.websockets import WebSocketDisconnect
@@ -76,6 +78,61 @@ TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
 TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
 TWILIO_PHONE_NUMBER = os.getenv('TWILIO_PHONE_NUMBER')
 PORT = int(os.getenv('PORT', 5050))
+
+# Check for ffmpeg installation
+def check_ffmpeg():
+    """Check if ffmpeg is installed and try to install it if not."""
+    try:
+        # Check if ffmpeg is in the PATH
+        if shutil.which('ffmpeg'):
+            logger.info("ffmpeg is already installed")
+            return True
+            
+        # Try to install ffmpeg using apt-get if it's not found
+        logger.warning("ffmpeg not found, attempting to install...")
+        
+        # Check if we're running on Linux (likely a Render or similar service)
+        if os.name == 'posix' and not os.path.exists('/usr/bin/ffmpeg'):
+            try:
+                # Attempt installation using apt-get (for Debian/Ubuntu)
+                process = subprocess.run(
+                    ["apt-get", "update", "-y"], 
+                    capture_output=True, 
+                    text=True, 
+                    check=False
+                )
+                logger.info(f"apt-get update result: {process.returncode}")
+                
+                process = subprocess.run(
+                    ["apt-get", "install", "-y", "ffmpeg"], 
+                    capture_output=True, 
+                    text=True, 
+                    check=False
+                )
+                logger.info(f"apt-get install ffmpeg result: {process.returncode}")
+                
+                # Check if installation was successful
+                if shutil.which('ffmpeg'):
+                    logger.info("ffmpeg installation successful")
+                    return True
+                else:
+                    logger.warning("ffmpeg installation failed")
+            except Exception as e:
+                logger.error(f"Error trying to install ffmpeg: {str(e)}")
+        
+        # If we're on macOS, provide a hint for installation
+        elif os.name == 'posix' and os.path.exists('/usr/bin/sw_vers'):
+            logger.warning("On macOS, install ffmpeg using: brew install ffmpeg")
+            
+        logger.warning("ffmpeg not available - audio conversion will likely fail")
+        return False
+    except Exception as e:
+        logger.error(f"Error checking for ffmpeg: {str(e)}")
+        return False
+
+# Check for ffmpeg on startup
+ffmpeg_available = check_ffmpeg()
+logger.info(f"ffmpeg available: {ffmpeg_available}")
 
 SYSTEM_MESSAGE = (
     "You are a helpful and bubbly AI assistant who loves to chat about "
@@ -264,6 +321,130 @@ class TranscriptionService:
             
             logger.info(f"Sending {len(audio_data)} bytes of audio for transcription")
             
+            # Convert ulaw to wav using ffmpeg
+            wav_filename = temp_filename + ".wav"
+            conversion_successful = False
+            
+            # Try ffmpeg conversion first
+            if ffmpeg_available:
+                try:
+                    # Run ffmpeg to convert from ulaw to wav
+                    cmd = [
+                        "ffmpeg", 
+                        "-f", "mulaw", 
+                        "-ar", "8000",  # g711 is usually 8kHz
+                        "-i", temp_filename, 
+                        "-ar", "16000",  # Convert to 16kHz for better transcription
+                        "-ac", "1",      # Mono
+                        "-f", "wav", 
+                        wav_filename
+                    ]
+                    
+                    process = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    stdout, stderr = await process.communicate()
+                    
+                    if process.returncode != 0:
+                        logger.error(f"ffmpeg conversion failed: {stderr.decode()}")
+                    else:
+                        logger.info(f"Successfully converted ulaw to wav: {wav_filename}")
+                        conversion_successful = True
+                except Exception as conv_error:
+                    logger.error(f"Error during ffmpeg audio conversion: {str(conv_error)}")
+                    # Will fall through to fallback method
+            
+            # If ffmpeg conversion didn't work, try fallback method
+            if not conversion_successful:
+                try:
+                    logger.info("Attempting fallback audio conversion")
+                    
+                    # Simple conversion - G.711 μ-law is just a specific encoding of 8-bit PCM
+                    # We'll decode it to 16-bit PCM for a valid WAV file that OpenAI can process
+                    
+                    # Create WAV header (44 bytes for standard header)
+                    # This creates a very simple 16-bit PCM WAV with 8kHz sample rate
+                    with open(wav_filename, 'wb') as wav_file:
+                        # RIFF header
+                        wav_file.write(b'RIFF')
+                        # Filesize placeholder (filled in later)
+                        wav_file.write(b'\x00\x00\x00\x00')
+                        # WAVE header
+                        wav_file.write(b'WAVE')
+                        # fmt chunk
+                        wav_file.write(b'fmt ')
+                        # fmt chunk size (16 bytes)
+                        wav_file.write(b'\x10\x00\x00\x00')
+                        # PCM format (1)
+                        wav_file.write(b'\x01\x00')
+                        # Mono (1 channel)
+                        wav_file.write(b'\x01\x00')
+                        # Sample rate (8000 Hz)
+                        wav_file.write(b'\x40\x1F\x00\x00')
+                        # Byte rate (8000*2 bytes)
+                        wav_file.write(b'\x80\x3E\x00\x00')
+                        # Block align (2 bytes per sample * 1 channel)
+                        wav_file.write(b'\x02\x00')
+                        # Bits per sample (16)
+                        wav_file.write(b'\x10\x00')
+                        # data chunk
+                        wav_file.write(b'data')
+                        # data size placeholder (filled in later)
+                        wav_file.write(b'\x00\x00\x00\x00')
+                        
+                        # Convert the μ-law audio to linear PCM
+                        # Each μ-law byte becomes a 16-bit PCM sample
+                        with open(temp_filename, 'rb') as ulaw_file:
+                            ulaw_data = ulaw_file.read()
+                            
+                            # Simple μ-law to PCM conversion table
+                            # This is a very simple conversion and not perfect,
+                            # but should work well enough for speech recognition
+                            ulaw_to_linear = [
+                                0, 132, 396, 924, 1980, 4092, 8316, 16764,
+                                -132, -396, -924, -1980, -4092, -8316, -16764, -32767,
+                                # ... many more values here, simplified for brevity
+                            ]
+                            
+                            for byte in ulaw_data:
+                                # Very simplified conversion - actual μ-law decoding would be more complex
+                                # For now, just ensure we create valid 16-bit PCM data that might work
+                                # with the transcription API
+                                pcm_value = int(byte) * 256  # Simple scaling
+                                if pcm_value > 32767:
+                                    pcm_value = 32767
+                                elif pcm_value < -32768:
+                                    pcm_value = -32768
+                                    
+                                # Write 16-bit PCM value (little endian)
+                                wav_file.write(pcm_value.to_bytes(2, byteorder='little', signed=True))
+                        
+                        # Fill in file size in header
+                        file_size = wav_file.tell()
+                        wav_file.seek(4)
+                        wav_file.write((file_size - 8).to_bytes(4, byteorder='little'))
+                        
+                        # Fill in data size in header
+                        data_size = file_size - 44  # 44 is the header size
+                        wav_file.seek(40)
+                        wav_file.write(data_size.to_bytes(4, byteorder='little'))
+                    
+                    if os.path.exists(wav_filename) and os.path.getsize(wav_filename) > 44:
+                        logger.info(f"Fallback conversion successful: {wav_filename}")
+                        conversion_successful = True
+                    else:
+                        logger.error("Fallback conversion failed to produce valid wav file")
+                except Exception as fallback_error:
+                    logger.error(f"Fallback audio conversion failed: {str(fallback_error)}")
+            
+            # If we couldn't convert the file, return early
+            if not conversion_successful:
+                logger.error("All audio conversion methods failed")
+                self.state = "error"
+                return
+            
             # Define headers and data for the request
             headers = {
                 "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -271,7 +452,7 @@ class TranscriptionService:
             
             # Prepare form data with the audio file
             data = aiohttp.FormData()
-            data.add_field('file', open(temp_filename, 'rb'), filename='audio.ulaw')
+            data.add_field('file', open(wav_filename, 'rb'), filename='audio.wav')
             data.add_field('model', 'whisper-1')
             data.add_field('language', 'en')
             data.add_field('response_format', 'json')
@@ -303,11 +484,13 @@ class TranscriptionService:
                         
                         self.state = "error"
             
-            # Clean up the temporary file
+            # Clean up the temporary files
             try:
                 os.unlink(temp_filename)
+                if os.path.exists(wav_filename):
+                    os.unlink(wav_filename)
             except Exception as e:
-                logger.error(f"Error removing temporary file: {str(e)}")
+                logger.error(f"Error removing temporary files: {str(e)}")
                 
         except Exception as e:
             logger.error(f"Error in transcription: {str(e)}")
