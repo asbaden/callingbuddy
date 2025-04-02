@@ -191,6 +191,7 @@ class TranscriptionService:
         self.continuous_interval = 60  # Process continuous audio every 60 seconds
         self.last_continuous_time = 0
         self.transcript_segments = []  # Store all transcript segments for post-processing
+        self.use_continuous = False    # Flag to control continuous transcription
     
     async def start(self):
         """Start the transcription service if it's not already running."""
@@ -308,8 +309,10 @@ class TranscriptionService:
                     self.last_processing_time = current_time  # Reset timer but keep audio
                 
                 # Process continuous audio periodically for a more complete transcription
-                if (current_time - self.last_continuous_time >= self.continuous_interval
-                    and len(self.continuous_audio) >= self.min_audio_length * 3):  # Ensure we have significant audio
+                # But only if the flag is enabled and we have enough audio
+                if (self.use_continuous and 
+                    current_time - self.last_continuous_time >= self.continuous_interval
+                    and len(self.continuous_audio) >= self.min_audio_length * 5):  # Increased threshold for continuous
                     
                     # Process one continuous chunk
                     logger.info(f"Processing continuous transcription ({len(self.continuous_audio)} bytes)")
@@ -507,15 +510,32 @@ class TranscriptionService:
                             # Store the raw segment for future context
                             self.transcript_segments.append(transcription.strip())
                             
-                            # For continuous transcription, replace rather than append
+                            # For continuous transcription, only replace if it looks significantly different 
+                            # from what we already have (to avoid replacing good incremental transcriptions)
                             if is_continuous:
-                                # Replace the buffer with a more complete transcription
-                                if transcription.strip():
+                                if not transcription.strip():
+                                    logger.info("Empty continuous transcription, ignoring")
+                                    return True
+                                    
+                                # Log current buffer for comparison
+                                current_content = " ".join([msg.replace("User: ", "") for msg in self.buffer])
+                                logger.info(f"Current buffer content: '{current_content}'")
+                                logger.info(f"Continuous transcription: '{transcription.strip()}'")
+                                
+                                # Check if the continuous transcription adds significant value
+                                if len(self.buffer) == 0 or (
+                                   len(transcription) > len(current_content) * 1.5 and  # Significantly longer
+                                   not any(seg in transcription for seg in self.transcript_segments[:5])  # Not just repeating segments
+                                ):
+                                    # Replace the buffer with a more complete transcription
                                     self.buffer = [f"User: {transcription.strip()}"]
-                                    logger.info(f"Updated buffer with continuous transcription: {transcription}")
+                                    logger.info(f"Updated buffer with continuous transcription (significant improvement)")
+                                else:
+                                    logger.info(f"Keeping existing buffer (continuous transcription not better)")
                             else:
                                 # Add to buffer (regular incremental transcription)
-                                self.buffer.append(f"User: {transcription}")
+                                if transcription.strip():
+                                    self.buffer.append(f"User: {transcription}")
                                 
                             return True
                     else:
@@ -773,10 +793,18 @@ async def handle_media_stream(websocket: WebSocket):
                         logger.info(f"Received event: {response['type']}")
                     
                     # Record transcribed text
-                    if response['type'] == 'response.content.part' and 'content' in response:
-                        message = f"AI: {response['content']}"
-                        full_transcription.append(message)
-                        logger.debug(f"AI message: {response['content']}")
+                    if (response['type'] == 'response.content.part' and 'content' in response) or (response['type'] == 'response.text.delta' and 'delta' in response):
+                        # Handle either API format (different OpenAI API versions)
+                        content = response.get('content', response.get('delta', ''))
+                        logger.debug(f"AI message part: {content}")
+                        
+                        if content:  # Only process non-empty content
+                            if full_transcription and full_transcription[-1].startswith("AI:"):
+                                # Append to previous AI message to form complete sentences
+                                full_transcription[-1] += content
+                            else:
+                                # Start a new AI message
+                                full_transcription.append(f"AI: {content}")
                     elif response['type'] == 'input_audio_buffer.transcript' and 'transcript' in response:
                         message = f"User: {response['transcript']}"
                         full_transcription.append(message)
@@ -858,44 +886,63 @@ async def handle_media_stream(websocket: WebSocket):
                     except Exception as e:
                         logger.error(f"Error processing final transcription: {e}")
                 
+                # Log the available transcriptions for debugging
+                logger.info(f"=== AVAILABLE TRANSCRIPTIONS ===")
+                logger.info(f"--- CUSTOM TRANSCRIPTION BUFFER ---")
+                for idx, msg in enumerate(transcription_service.buffer):
+                    logger.info(f"[{idx}] {msg}")
+                
+                logger.info(f"--- REAL-TIME TRANSCRIPTION ---")
+                for idx, msg in enumerate(full_transcription):
+                    logger.info(f"[{idx}] {msg}")
+                logger.info(f"=== END AVAILABLE TRANSCRIPTIONS ===")
+                
                 logger.info(f"Adding {len(transcription_service.buffer)} items from custom transcription service")
                 
-                # If we have a custom transcription (which may be more accurate), use it
-                if len(transcription_service.buffer) == 1 and transcription_service.buffer[0].startswith("User:"):
-                    # We have a single comprehensive transcription
-                    consolidated_transcript = transcription_service.buffer[0]
-                    logger.info(f"Using consolidated transcription: {consolidated_transcript}")
+                # Important change: Check if we have incremental transcriptions first
+                # They are often more accurate than the continuous one
+                incremental_user_msgs = [msg for msg in transcription_service.buffer 
+                                        if msg.startswith("User:") and not msg.endswith("Hello?")]
+                
+                if has_real_time_transcripts:
+                    # We have real-time transcripts and may have incremental custom transcriptions
                     
-                    # If we have real-time transcripts that include AI responses, we should preserve the conversational flow
-                    if has_real_time_transcripts:
-                        # Categorize messages by type for easier processing
-                        realtime_user_msgs = [msg for msg in full_transcription if msg.startswith("User:")]
-                        ai_msgs = [msg for msg in full_transcription if msg.startswith("AI:")]
-                        
-                        logger.info(f"Found {len(realtime_user_msgs)} user messages and {len(ai_msgs)} AI messages from real-time API")
-                        
-                        # If we have AI messages, create a proper conversation flow
-                        if ai_msgs:
-                            # Start with the consolidated user transcript (more accurate)
+                    # Categorize messages by type for easier processing
+                    realtime_user_msgs = [msg for msg in full_transcription if msg.startswith("User:")]
+                    ai_msgs = [msg for msg in full_transcription if msg.startswith("AI:")]
+                    
+                    logger.info(f"Found {len(realtime_user_msgs)} user messages and {len(ai_msgs)} AI messages from real-time API")
+                    
+                    # If we have AI messages, create a proper conversation flow
+                    if ai_msgs:
+                        # Start with user messages (prioritize incremental custom transcriptions if available)
+                        if incremental_user_msgs:
+                            logger.info(f"Using {len(incremental_user_msgs)} incremental custom transcriptions")
+                            final_transcription = incremental_user_msgs
+                        elif len(transcription_service.buffer) == 1 and transcription_service.buffer[0].startswith("User:"):
+                            # Fall back to consolidated transcript if no incremental ones
+                            consolidated_transcript = transcription_service.buffer[0]
+                            logger.info(f"Using consolidated transcription: {consolidated_transcript}")
                             final_transcription = [consolidated_transcript]
-                            
-                            # Then add all AI responses to maintain the conversation flow
-                            final_transcription.extend(ai_msgs)
                         else:
-                            # No AI messages, just use the consolidated transcript
-                            final_transcription = [consolidated_transcript]
+                            # Fall back to real-time user messages if nothing better
+                            final_transcription = realtime_user_msgs
+                            
+                        # Then add all AI responses to maintain the conversation flow
+                        final_transcription.extend(ai_msgs)
                     else:
-                        # No real-time transcripts, just use the consolidated one
-                        final_transcription = [consolidated_transcript]
+                        # No AI messages, just use the best user transcriptions
+                        if incremental_user_msgs:
+                            final_transcription = incremental_user_msgs
+                        elif len(transcription_service.buffer) == 1:
+                            final_transcription = [transcription_service.buffer[0]]
+                        else:
+                            final_transcription = realtime_user_msgs if realtime_user_msgs else transcription_service.buffer
                 else:
-                    # We have multiple fragments from the transcription service
-                    
-                    if has_real_time_transcripts:
-                        # Try to merge both sources to maintain conversation flow
-                        # Use a simple approach of just combining both sets
-                        final_transcription = transcription_service.buffer + full_transcription
+                    # No real-time transcripts, just use the best custom ones
+                    if incremental_user_msgs:
+                        final_transcription = incremental_user_msgs
                     else:
-                        # No real-time transcripts, just use the fragments
                         final_transcription = transcription_service.buffer
             else:
                 # No custom transcription, use the real-time one
