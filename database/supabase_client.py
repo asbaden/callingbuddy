@@ -1,6 +1,7 @@
 import os
 import logging
 import traceback
+import requests
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
@@ -14,15 +15,23 @@ load_dotenv()
 # Initialize Supabase client
 supabase_url = os.getenv("SUPABASE_URL")
 supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+supabase_anon_key = os.getenv("SUPABASE_ANON_KEY")
 
 # Debug output to verify API keys are loaded correctly
 logger.info(f"Supabase URL: {supabase_url}")
 if supabase_key:
-    logger.info(f"Supabase Key length: {len(supabase_key)} chars")
-    logger.info(f"Supabase Key first 10 chars: {supabase_key[:10]}...")
-    logger.info(f"Supabase Key last 10 chars: {supabase_key[-10:]}")
+    logger.info(f"Service Key length: {len(supabase_key)} chars")
+    logger.info(f"Service Key first 10 chars: {supabase_key[:10]}...")
+    logger.info(f"Service Key last 10 chars: {supabase_key[-10:]}")
 else:
-    logger.error("Supabase key is not set!")
+    logger.error("Supabase service key is not set!")
+
+if supabase_anon_key:
+    logger.info(f"Anon Key length: {len(supabase_anon_key)} chars")
+    logger.info(f"Anon Key first 10 chars: {supabase_anon_key[:10]}...")
+    logger.info(f"Anon Key last 10 chars: {supabase_anon_key[-10:]}")
+else:
+    logger.warning("Supabase anon key is not set!")
 
 # Flag to track if Supabase is available
 supabase_available = False
@@ -30,25 +39,54 @@ supabase = None
 
 # Try to initialize Supabase client
 try:
-    # Simple initialization for version 1.0.3
+    # Try a direct REST API call first to test connectivity
+    if supabase_url and (supabase_key or supabase_anon_key):
+        auth_key = supabase_key or supabase_anon_key
+        headers = {
+            "apikey": auth_key,
+            "Authorization": f"Bearer {auth_key}"
+        }
+        test_url = f"{supabase_url}/rest/v1/users?limit=1"
+        logger.info(f"Testing direct REST API connectivity to: {test_url}")
+        response = requests.get(test_url, headers=headers)
+        logger.info(f"Direct API test response: {response.status_code} - {response.reason}")
+        if response.status_code == 200:
+            logger.info("REST API connectivity successful!")
+        else:
+            logger.warning(f"REST API test failed with status {response.status_code}: {response.text}")
+    
+    # Try multiple initialization methods
+    logger.info("Attempting to initialize Supabase client...")
+    
+    # Try with service role key first
     if supabase_url and supabase_key:
-        logger.info("Attempting to initialize Supabase client...")
-        supabase = create_client(supabase_url, supabase_key)
-        
-        # Test the connection with a simple query
-        logger.info("Testing Supabase connection with a simple query...")
-        test = supabase.table("users").select("*").limit(1).execute()
-        logger.info(f"Supabase test query result: {test}")
-        
-        supabase_available = True
+        try:
+            logger.info("Trying with service role key...")
+            supabase = create_client(supabase_url, supabase_key)
+            # Test the connection
+            test = supabase.table("users").select("*").limit(1).execute()
+            logger.info("Service role key connection successful!")
+            supabase_available = True
+        except Exception as e:
+            logger.warning(f"Service role key connection failed: {str(e)}")
+            
+            # If service role key fails, try anon key
+            if supabase_url and supabase_anon_key:
+                try:
+                    logger.info("Trying with anon key...")
+                    supabase = create_client(supabase_url, supabase_anon_key)
+                    # Test the connection
+                    test = supabase.table("users").select("*").limit(1).execute()
+                    logger.info("Anon key connection successful!")
+                    supabase_available = True
+                except Exception as e2:
+                    logger.warning(f"Anon key connection failed: {str(e2)}")
+    
+    if supabase_available:
         logger.info("Supabase client initialized successfully!")
     else:
-        missing_vars = []
-        if not supabase_url:
-            missing_vars.append("SUPABASE_URL")
-        if not supabase_key:
-            missing_vars.append("SUPABASE_SERVICE_ROLE_KEY")
-        logger.error(f"Missing Supabase credentials: {', '.join(missing_vars)}. Database functionality will be disabled.")
+        logger.error("All Supabase connection attempts failed")
+        
 except Exception as e:
     logger.error(f"Error initializing Supabase client: {str(e)}")
     logger.error(f"Error details: {traceback.format_exc()}")
@@ -107,7 +145,7 @@ async def create_call(user_id, call_sid=None, status="initiated"):
         logger.error(f"Error creating call: {e}")
         return {"id": "dummy-call-id", "user_id": user_id, "call_sid": call_sid}
 
-async def update_call(call_id, status=None, ended_at=None, duration_seconds=None):
+async def update_call(call_id, status=None, ended_at=None, duration_seconds=None, call_sid=None):
     """Update an existing call record."""
     if not supabase_available:
         logger.warning("Supabase not available - call update skipped")
@@ -121,6 +159,8 @@ async def update_call(call_id, status=None, ended_at=None, duration_seconds=None
             call_data["ended_at"] = ended_at
         if duration_seconds:
             call_data["duration_seconds"] = duration_seconds
+        if call_sid:
+            call_data["call_sid"] = call_sid
         
         result = supabase.table("calls").update(call_data).eq("id", call_id).execute()
         return result.data[0] if result.data else None

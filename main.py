@@ -180,7 +180,8 @@ async def call_user(request: Request):
         # Update the call record with Twilio's call SID if we have a real db call
         try:
             if db_call['id'] != "dummy-call-id":
-                await update_call(call_id=db_call['id'], call_sid=call.sid)
+                # Now we can include call_sid as the parameter is supported
+                await update_call(call_id=db_call['id'], status="initiated", call_sid=call.sid)
                 logger.info(f"Updated call record with Twilio SID {call.sid}")
         except Exception as update_error:
             logger.error(f"Failed to update call record: {update_error}")
