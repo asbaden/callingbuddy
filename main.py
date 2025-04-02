@@ -187,6 +187,10 @@ class TranscriptionService:
         self.last_processing_time = 0
         self.processing_interval = 5  # Increase from 3 to 5 seconds to collect more audio
         self.min_audio_length = 8000  # Minimum audio length in bytes (about 1 second of 8kHz audio)
+        self.continuous_audio = b''   # Store all audio for one continuous transcription
+        self.continuous_interval = 60  # Process continuous audio every 60 seconds
+        self.last_continuous_time = 0
+        self.transcript_segments = []  # Store all transcript segments for post-processing
     
     async def start(self):
         """Start the transcription service if it's not already running."""
@@ -284,6 +288,7 @@ class TranscriptionService:
                 if not self.audio_queue.empty():
                     audio_data = await self.audio_queue.get()
                     self.accumulated_audio += audio_data
+                    self.continuous_audio += audio_data  # Add to continuous buffer as well
                     self.audio_queue.task_done()
                 
                 # Process accumulated audio if enough time has passed AND we have enough audio
@@ -302,6 +307,23 @@ class TranscriptionService:
                     logger.info(f"Not enough audio to transcribe ({len(self.accumulated_audio)} < {self.min_audio_length} bytes), waiting for more...")
                     self.last_processing_time = current_time  # Reset timer but keep audio
                 
+                # Process continuous audio periodically for a more complete transcription
+                if (current_time - self.last_continuous_time >= self.continuous_interval
+                    and len(self.continuous_audio) >= self.min_audio_length * 3):  # Ensure we have significant audio
+                    
+                    # Process one continuous chunk
+                    logger.info(f"Processing continuous transcription ({len(self.continuous_audio)} bytes)")
+                    try:
+                        result = await self._transcribe_audio(self.continuous_audio, is_continuous=True)
+                        if result:
+                            # We got a successful continuous transcription, clear the buffer
+                            self.continuous_audio = b''
+                            self.last_continuous_time = current_time
+                    except Exception as e:
+                        logger.error(f"Error in continuous transcription: {str(e)}")
+                        # Reset timer but keep trying
+                        self.last_continuous_time = current_time
+                
                 # Small delay to avoid busy waiting
                 await asyncio.sleep(0.1)
                 
@@ -314,21 +336,19 @@ class TranscriptionService:
             logger.error(traceback.format_exc())
             self.state = "error"
     
-    async def _transcribe_audio(self, audio_data):
+    async def _transcribe_audio(self, audio_data, is_continuous=False):
         """Send audio data to OpenAI Whisper API for transcription."""
         if not audio_data or len(audio_data) < self.min_audio_length:  # Skip very small audio chunks
             logger.warning(f"Audio too short for transcription: {len(audio_data)} bytes")
-            return
+            return False
             
-        logger.info(f"Sending {len(audio_data)} bytes of audio for transcription")
+        logger.info(f"Sending {len(audio_data)} bytes of audio for transcription{' (continuous)' if is_continuous else ''}")
         
         try:
             # Save audio to a temporary file
             with tempfile.NamedTemporaryFile(suffix=".ulaw", delete=False) as temp_file:
                 temp_filename = temp_file.name
                 temp_file.write(audio_data)
-            
-            logger.info(f"Sending {len(audio_data)} bytes of audio for transcription")
             
             # Convert ulaw to wav using ffmpeg
             wav_filename = temp_filename + ".wav"
@@ -452,7 +472,7 @@ class TranscriptionService:
             if not conversion_successful:
                 logger.error("All audio conversion methods failed")
                 self.state = "error"
-                return
+                return False
             
             # Define headers and data for the request
             headers = {
@@ -466,6 +486,11 @@ class TranscriptionService:
             data.add_field('language', 'en')
             data.add_field('response_format', 'json')
             
+            # For continuous transcription, add prompt with previous segments
+            if is_continuous and self.transcript_segments:
+                recent_segments = " ".join(self.transcript_segments[-5:])  # Use last 5 segments as context
+                data.add_field('prompt', f"Previous segments: {recent_segments}")
+            
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     'https://api.openai.com/v1/audio/transcriptions',
@@ -477,10 +502,22 @@ class TranscriptionService:
                         transcription = result.get('text', '')
                         
                         if transcription:
-                            logger.info(f"Transcription result: {transcription}")
+                            logger.info(f"Transcription result{' (continuous)' if is_continuous else ''}: {transcription}")
                             
-                            # Add to buffer
-                            self.buffer.append(f"User: {transcription}")
+                            # Store the raw segment for future context
+                            self.transcript_segments.append(transcription.strip())
+                            
+                            # For continuous transcription, replace rather than append
+                            if is_continuous:
+                                # Replace the buffer with a more complete transcription
+                                if transcription.strip():
+                                    self.buffer = [f"User: {transcription.strip()}"]
+                                    logger.info(f"Updated buffer with continuous transcription: {transcription}")
+                            else:
+                                # Add to buffer (regular incremental transcription)
+                                self.buffer.append(f"User: {transcription}")
+                                
+                            return True
                     else:
                         error_text = await response.text()
                         logger.error(f"Transcription API error: {response.status} - {error_text}")
@@ -492,6 +529,7 @@ class TranscriptionService:
                             logger.error("Bad request: The API couldn't process the audio format")
                         
                         self.state = "error"
+                        return False
             
             # Clean up the temporary files
             try:
@@ -506,6 +544,7 @@ class TranscriptionService:
             import traceback
             logger.error(traceback.format_exc())
             self.state = "error"
+            return False
 
     async def get_buffer(self):
         """Get a copy of the current transcription buffer."""
@@ -798,23 +837,50 @@ async def handle_media_stream(websocket: WebSocket):
         # Log the transcription even if we can't save it to a specific call
         if full_transcription or transcription_service.buffer:
             # Merge the transcription buffer with the full transcription
-            if transcription_service.buffer:
-                logger.info(f"Adding {len(transcription_service.buffer)} items from transcription buffer")
-                # Combine both transcription sources
-                combined_transcription = []
-                
-                # Simple merge - in a real app, you might want to timestamp and order them properly
-                if full_transcription:
-                    combined_transcription.extend(full_transcription)
-                if transcription_service.buffer:
-                    combined_transcription.extend(transcription_service.buffer)
-                
-                transcription_text = "\n".join(combined_transcription)
-            else:
-                # Just use the existing full_transcription
-                transcription_text = "\n".join(full_transcription)
+            final_transcription = []
             
-            # Try to store in global variable for force-save endpoint
+            # Process transcriptions from the OpenAI conversation API
+            if full_transcription:
+                logger.info(f"Adding {len(full_transcription)} items from real-time transcription")
+                final_transcription.extend(full_transcription)
+            
+            # Get transcriptions from our custom transcription service
+            if transcription_service.buffer:
+                # Process final continuous transcription if available
+                if len(transcription_service.continuous_audio) >= transcription_service.min_audio_length:
+                    try:
+                        logger.info(f"Processing final continuous transcription ({len(transcription_service.continuous_audio)} bytes)")
+                        # Process the remaining continuous audio without clearing the buffer
+                        await transcription_service._transcribe_audio(
+                            transcription_service.continuous_audio, 
+                            is_continuous=True
+                        )
+                    except Exception as e:
+                        logger.error(f"Error processing final transcription: {e}")
+                
+                logger.info(f"Adding {len(transcription_service.buffer)} items from custom transcription service")
+                
+                # If we have a custom transcription (which may be more accurate), use it
+                if len(transcription_service.buffer) == 1 and transcription_service.buffer[0].startswith("User:"):
+                    # We have a single comprehensive transcription
+                    consolidated_transcript = transcription_service.buffer[0]
+                    logger.info(f"Using consolidated transcription: {consolidated_transcript}")
+                    final_transcription = [consolidated_transcript] + final_transcription
+                else:
+                    # We have multiple fragments, append them
+                    final_transcription.extend(transcription_service.buffer)
+            
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_transcription = []
+            for item in final_transcription:
+                if item not in seen:
+                    seen.add(item)
+                    unique_transcription.append(item)
+            
+            transcription_text = "\n".join(unique_transcription)
+            
+            # Store in global variable for force-save endpoint
             try:
                 global last_transcription_text, last_call_sid
                 last_transcription_text = transcription_text
@@ -823,7 +889,7 @@ async def handle_media_stream(websocket: WebSocket):
             except Exception as e:
                 logger.error(f"Error storing global transcription: {e}")
             
-            logger.info(f"Call ended. Transcription ({len(full_transcription) + len(transcription_service.buffer)} messages):")
+            logger.info(f"Call ended. Transcription ({len(unique_transcription)} messages):")
             logger.info(f"--- TRANSCRIPTION START ---")
             logger.info(transcription_text)
             logger.info(f"--- TRANSCRIPTION END ---")
