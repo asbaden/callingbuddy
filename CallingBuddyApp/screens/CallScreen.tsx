@@ -3,23 +3,9 @@ import { StyleSheet, Text, View, TouchableOpacity, TextInput, Alert, ActivityInd
 import { useNavigation } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../App';
-import axios from 'axios';
 import { BACKEND_URL } from '../utils/config';
 
 type CallScreenNavigationProp = NativeStackNavigationProp<RootStackParamList, 'Call'>;
-
-// Create axios instance with configuration for iOS simulator compatibility
-const api = axios.create({
-  timeout: 30000,
-  headers: {
-    'Content-Type': 'application/json',
-    'Accept': 'application/json',
-  },
-  // Disable certificate validation for simulator (development only)
-  ...(Platform.OS === 'ios' && __DEV__ ? { 
-    validateStatus: () => true 
-  } : {})
-});
 
 export default function CallScreen() {
   const navigation = useNavigation<CallScreenNavigationProp>();
@@ -65,7 +51,7 @@ export default function CallScreen() {
     try {
       console.log(`Making request to: ${BACKEND_URL}/call-user`);
       
-      // Try using fetch instead of axios (sometimes works better in simulator)
+      // Using fetch API
       const response = await fetch(`${BACKEND_URL}/call-user`, {
         method: 'POST',
         headers: {
