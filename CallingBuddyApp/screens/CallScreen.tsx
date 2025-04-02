@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { StyleSheet, Text, View, TouchableOpacity, TextInput, Alert, ActivityIndicator } from 'react-native';
+import React, { useState, useEffect } from 'react';
+import { StyleSheet, Text, View, TouchableOpacity, TextInput, Alert, ActivityIndicator, Platform } from 'react-native';
 import { useNavigation } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../App';
@@ -8,16 +8,49 @@ import { BACKEND_URL } from '../utils/config';
 
 type CallScreenNavigationProp = NativeStackNavigationProp<RootStackParamList, 'Call'>;
 
+// Create axios instance with configuration for iOS simulator compatibility
+const api = axios.create({
+  timeout: 30000,
+  headers: {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+  },
+  // Disable certificate validation for simulator (development only)
+  ...(Platform.OS === 'ios' && __DEV__ ? { 
+    validateStatus: () => true 
+  } : {})
+});
+
 export default function CallScreen() {
   const navigation = useNavigation<CallScreenNavigationProp>();
   const [phoneNumber, setPhoneNumber] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [serverStatus, setServerStatus] = useState<'unknown' | 'up' | 'down'>('unknown');
 
-  // Set a longer timeout for API calls
-  const axiosInstance = axios.create({
-    timeout: 60000  // 60 seconds timeout
-  });
+  // Check server status on component mount
+  useEffect(() => {
+    const checkServer = async () => {
+      try {
+        const response = await fetch(`${BACKEND_URL}/`, { 
+          method: 'GET',
+          headers: { 'Accept': 'application/json' },
+        });
+        if (response.ok) {
+          console.log('Server is up!');
+          setServerStatus('up');
+        } else {
+          console.log('Server returned error:', response.status);
+          setServerStatus('down');
+        }
+      } catch (error) {
+        console.log('Error checking server:', error);
+        setServerStatus('down');
+      }
+    };
+    
+    checkServer();
+  }, []);
 
   const initiateCall = async () => {
     // Simple validation
@@ -32,12 +65,22 @@ export default function CallScreen() {
     try {
       console.log(`Making request to: ${BACKEND_URL}/call-user`);
       
-      // Request the Twilio service to call the user
-      const response = await axiosInstance.post(`${BACKEND_URL}/call-user`, {
-        to: phoneNumber,
+      // Try using fetch instead of axios (sometimes works better in simulator)
+      const response = await fetch(`${BACKEND_URL}/call-user`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+        body: JSON.stringify({ to: phoneNumber }),
       });
-
-      console.log('Response:', response.data);
+      
+      if (!response.ok) {
+        throw new Error(`Server returned ${response.status}: ${response.statusText}`);
+      }
+      
+      const data = await response.json();
+      console.log('Response:', data);
       
       Alert.alert(
         'Call Initiated',
@@ -47,19 +90,9 @@ export default function CallScreen() {
     } catch (error: any) {
       console.error('Error initiating call:', error);
       
-      // Get more detailed error information
       let errorMsg = 'There was a problem initiating the call.';
-      
-      if (axios.isAxiosError(error)) {
-        if (error.code === 'ECONNABORTED') {
-          errorMsg = 'Request timed out. The server might be starting up. Please try again in a minute.';
-        } else {
-          errorMsg += ` Status: ${error.response?.status || 'unknown'}`;
-          errorMsg += ` Message: ${error.message}`;
-          if (error.response?.data) {
-            errorMsg += ` Details: ${JSON.stringify(error.response.data)}`;
-          }
-        }
+      if (error.message) {
+        errorMsg += ` Error: ${error.message}`;
       }
       
       setErrorMessage(errorMsg);
@@ -88,6 +121,15 @@ export default function CallScreen() {
         </Text>
       </View>
       
+      <View style={styles.serverStatusContainer}>
+        <Text style={styles.serverStatusText}>
+          Server Status: {
+            serverStatus === 'unknown' ? 'Checking...' :
+            serverStatus === 'up' ? 'Online ✅' : 'Offline ❌'
+          }
+        </Text>
+      </View>
+      
       <View style={styles.inputContainer}>
         <Text style={styles.label}>Your Phone Number</Text>
         <TextInput
@@ -102,9 +144,12 @@ export default function CallScreen() {
       </View>
       
       <TouchableOpacity 
-        style={styles.callButton}
+        style={[
+          styles.callButton,
+          (isLoading || serverStatus === 'down') && styles.callButtonDisabled
+        ]}
         onPress={initiateCall}
-        disabled={isLoading}
+        disabled={isLoading || serverStatus === 'down'}
       >
         {isLoading ? (
           <ActivityIndicator color="#fff" />
@@ -123,8 +168,8 @@ export default function CallScreen() {
       <Text style={styles.noteSectionTitle}>Notes:</Text>
       <View style={styles.noteContainer}>
         <Text style={styles.noteText}>• First response may take a few seconds</Text>
-        <Text style={styles.noteText}>• Our service may be slow to start (free tier)</Text>
-        <Text style={styles.noteText}>• If it fails, please try again in a minute</Text>
+        <Text style={styles.noteText}>• Make sure your phone number is correct</Text>
+        <Text style={styles.noteText}>• Using a physical device may work better than the simulator</Text>
       </View>
     </View>
   );
@@ -147,7 +192,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#fff',
     borderRadius: 12,
     padding: 20,
-    marginBottom: 25,
+    marginBottom: 15,
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.1,
@@ -165,6 +210,18 @@ const styles = StyleSheet.create({
     lineHeight: 22,
     color: '#555',
     marginBottom: 10,
+  },
+  serverStatusContainer: {
+    backgroundColor: '#f0f7ff',
+    padding: 10,
+    borderRadius: 8,
+    marginBottom: 20,
+    alignItems: 'center',
+  },
+  serverStatusText: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: '#3498db',
   },
   inputContainer: {
     marginBottom: 25,
@@ -198,6 +255,9 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.1,
     shadowRadius: 3,
     elevation: 2,
+  },
+  callButtonDisabled: {
+    backgroundColor: '#a0a0a0',
   },
   callButtonText: {
     color: 'white',
