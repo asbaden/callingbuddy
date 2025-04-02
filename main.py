@@ -185,7 +185,8 @@ class TranscriptionService:
         self.max_errors = 3
         self.accumulated_audio = b''  # To accumulate audio data for batch processing
         self.last_processing_time = 0
-        self.processing_interval = 3  # Process audio every 3 seconds
+        self.processing_interval = 5  # Increase from 3 to 5 seconds to collect more audio
+        self.min_audio_length = 8000  # Minimum audio length in bytes (about 1 second of 8kHz audio)
     
     async def start(self):
         """Start the transcription service if it's not already running."""
@@ -285,9 +286,9 @@ class TranscriptionService:
                     self.accumulated_audio += audio_data
                     self.audio_queue.task_done()
                 
-                # Process accumulated audio if enough time has passed
+                # Process accumulated audio if enough time has passed AND we have enough audio
                 if (current_time - self.last_processing_time >= self.processing_interval 
-                    and len(self.accumulated_audio) > 0):
+                    and len(self.accumulated_audio) >= self.min_audio_length):
                     
                     # Send accumulated audio for transcription
                     await self._transcribe_audio(self.accumulated_audio)
@@ -295,6 +296,11 @@ class TranscriptionService:
                     # Reset accumulated audio and update timer
                     self.accumulated_audio = b''
                     self.last_processing_time = current_time
+                elif (current_time - self.last_processing_time >= self.processing_interval 
+                    and len(self.accumulated_audio) > 0):
+                    # If we have audio but not enough, log it and wait for more
+                    logger.info(f"Not enough audio to transcribe ({len(self.accumulated_audio)} < {self.min_audio_length} bytes), waiting for more...")
+                    self.last_processing_time = current_time  # Reset timer but keep audio
                 
                 # Small delay to avoid busy waiting
                 await asyncio.sleep(0.1)
@@ -310,9 +316,12 @@ class TranscriptionService:
     
     async def _transcribe_audio(self, audio_data):
         """Send audio data to OpenAI Whisper API for transcription."""
-        if not audio_data or len(audio_data) < 100:  # Skip very small audio chunks
+        if not audio_data or len(audio_data) < self.min_audio_length:  # Skip very small audio chunks
+            logger.warning(f"Audio too short for transcription: {len(audio_data)} bytes")
             return
             
+        logger.info(f"Sending {len(audio_data)} bytes of audio for transcription")
+        
         try:
             # Save audio to a temporary file
             with tempfile.NamedTemporaryFile(suffix=".ulaw", delete=False) as temp_file:
@@ -640,6 +649,7 @@ async def handle_media_stream(websocket: WebSocket):
     # Variables to track the call and collect transcription
     stream_sid = None
     full_transcription = []
+    websocket_closed = False
     
     # Create a timestamp for this session
     session_timestamp = asyncio.get_event_loop().time()
@@ -656,7 +666,7 @@ async def handle_media_stream(websocket: WebSocket):
         
         async def receive_from_twilio():
             """Receive audio data from Twilio and send it to the OpenAI Realtime API."""
-            nonlocal stream_sid
+            nonlocal stream_sid, websocket_closed
             try:
                 async for message in websocket.iter_text():
                     data = json.loads(message)
@@ -695,6 +705,13 @@ async def handle_media_stream(websocket: WebSocket):
                             logger.error(f"Error mapping stream to call: {mapping_error}")
             except WebSocketDisconnect:
                 logger.info("Client disconnected from media stream")
+                websocket_closed = True
+            except Exception as e:
+                logger.error(f"Error in receive_from_twilio: {e}")
+                websocket_closed = True
+            finally:
+                # Always mark the WebSocket as closed when this task exits
+                websocket_closed = True
                 
                 # Stop the transcription session if it's running
                 global transcription_service
@@ -704,107 +721,10 @@ async def handle_media_stream(websocket: WebSocket):
                         logger.info("Closed transcription session")
                     except Exception as e:
                         logger.error(f"Error closing transcription session: {str(e)}")
-                
-                # Log the transcription even if we can't save it to a specific call
-                if full_transcription or transcription_service.buffer:
-                    # Merge the transcription buffer with the full transcription
-                    if transcription_service.buffer:
-                        logger.info(f"Adding {len(transcription_service.buffer)} items from transcription buffer")
-                        # Combine both transcription sources
-                        combined_transcription = []
-                        
-                        # Simple merge - in a real app, you might want to timestamp and order them properly
-                        if full_transcription:
-                            combined_transcription.extend(full_transcription)
-                        if transcription_service.buffer:
-                            combined_transcription.extend(transcription_service.buffer)
-                        
-                        transcription_text = "\n".join(combined_transcription)
-                    else:
-                        # Just use the existing full_transcription
-                        transcription_text = "\n".join(full_transcription)
-                    
-                    # Store in global variable for force-save endpoint
-                    global last_transcription_text, last_call_sid
-                    last_transcription_text = transcription_text
-                    if stream_sid in call_mapping['stream_sid_to_call_sid']:
-                        last_call_sid = call_mapping['stream_sid_to_call_sid'][stream_sid]
-                    
-                    logger.info(f"Call ended. Transcription ({len(full_transcription) + len(transcription_service.buffer)} messages):")
-                    logger.info(f"--- TRANSCRIPTION START ---")
-                    logger.info(transcription_text)
-                    logger.info(f"--- TRANSCRIPTION END ---")
-                    
-                    # Save to a file as a fallback option
-                    try:
-                        import datetime
-                        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                        filename = f"transcription_{timestamp}.txt"
-                        
-                        with open(filename, "w") as f:
-                            f.write(transcription_text)
-                        
-                        logger.info(f"Saved transcription to file: {filename}")
-                    except Exception as file_error:
-                        logger.error(f"Could not save transcription to file: {file_error}")
-                    
-                    # Try to save to Supabase if possible
-                    if supabase_available:
-                        try:
-                            # Try to find the matching call for this stream
-                            call_id = None
-                            
-                            # First check if we have a direct stream to call mapping
-                            if stream_sid and stream_sid in call_mapping['stream_sid_to_call_sid']:
-                                call_sid = call_mapping['stream_sid_to_call_sid'][stream_sid]
-                                logger.info(f"Found call SID {call_sid} for stream {stream_sid}")
-                                
-                                if call_sid in call_mapping['call_sid_to_info']:
-                                    call_info = call_mapping['call_sid_to_info'][call_sid]
-                                    call_id = call_info['call_id']
-                                    logger.info(f"Found call record ID {call_id} for call SID {call_sid}")
-                            
-                            # If no direct mapping, try the most recent call
-                            if not call_id:
-                                recent_calls = []
-                                for call_sid, call_info in call_mapping['call_sid_to_info'].items():
-                                    if 'call_id' in call_info and call_info['call_id'] != "dummy-call-id":
-                                        recent_calls.append((call_info.get('timestamp', 0), call_info))
-                                
-                                if recent_calls:
-                                    # Sort by timestamp and get the most recent
-                                    recent_calls.sort(key=lambda x: x[0])
-                                    call_info = recent_calls[-1][1]
-                                    call_id = call_info['call_id']
-                                    logger.info(f"Using most recent call with ID: {call_id}")
-                            
-                            if call_id:
-                                # Save the transcription
-                                transcription = await create_transcription(
-                                    call_id=call_id,
-                                    content=transcription_text
-                                )
-                                
-                                # Update the call record
-                                import datetime
-                                await update_call(
-                                    call_id=call_id, 
-                                    status="completed",
-                                    ended_at=datetime.datetime.now().isoformat()
-                                )
-                                
-                                logger.info(f"Saved transcription to database for call ID: {call_id}")
-                            else:
-                                logger.warning("No matching call found in our mapping - transcription not saved to database")
-                        except Exception as db_error:
-                            logger.error(f"Failed to save transcription to database: {db_error}")
-                
-                if openai_ws.open:
-                    await openai_ws.close()
 
         async def send_to_twilio():
             """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
-            nonlocal stream_sid, full_transcription
+            nonlocal stream_sid, full_transcription, websocket_closed
             try:
                 async for openai_message in openai_ws:
                     response = json.loads(openai_message)
@@ -829,17 +749,23 @@ async def handle_media_stream(websocket: WebSocket):
                     if response['type'] == 'response.audio.delta' and response.get('delta'):
                         # Audio from OpenAI
                         try:
-                            audio_payload = base64.b64encode(base64.b64decode(response['delta'])).decode('utf-8')
-                            audio_delta = {
-                                "event": "media",
-                                "streamSid": stream_sid,
-                                "media": {
-                                    "payload": audio_payload
+                            if not websocket_closed:
+                                audio_payload = base64.b64encode(base64.b64decode(response['delta'])).decode('utf-8')
+                                audio_delta = {
+                                    "event": "media",
+                                    "streamSid": stream_sid,
+                                    "media": {
+                                        "payload": audio_payload
+                                    }
                                 }
-                            }
-                            await websocket.send_json(audio_delta)
+                                await websocket.send_json(audio_delta)
                         except Exception as e:
-                            logger.error(f"Error processing audio data: {e}")
+                            if "websocket.close" in str(e) or "already completed" in str(e):
+                                # Connection was closed, mark it
+                                websocket_closed = True
+                                logger.info("WebSocket closed, stopping audio transmission")
+                            else:
+                                logger.error(f"Error processing audio data: {e}")
             except Exception as e:
                 logger.error(f"Error in send_to_twilio: {e}")
                 
@@ -851,7 +777,124 @@ async def handle_media_stream(websocket: WebSocket):
                     logger.info(transcription_text)
                     logger.info(f"--- TRANSCRIPTION END ---")
 
-        await asyncio.gather(receive_from_twilio(), send_to_twilio())
+        # Start both tasks and wait for them to complete
+        twilio_receiver = asyncio.create_task(receive_from_twilio())
+        openai_sender = asyncio.create_task(send_to_twilio())
+        
+        done, pending = await asyncio.wait(
+            [twilio_receiver, openai_sender],
+            return_when=asyncio.FIRST_COMPLETED
+        )
+        
+        # Cancel any pending tasks
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+                
+        # Clean up and save the transcription
+        # Log the transcription even if we can't save it to a specific call
+        if full_transcription or transcription_service.buffer:
+            # Merge the transcription buffer with the full transcription
+            if transcription_service.buffer:
+                logger.info(f"Adding {len(transcription_service.buffer)} items from transcription buffer")
+                # Combine both transcription sources
+                combined_transcription = []
+                
+                # Simple merge - in a real app, you might want to timestamp and order them properly
+                if full_transcription:
+                    combined_transcription.extend(full_transcription)
+                if transcription_service.buffer:
+                    combined_transcription.extend(transcription_service.buffer)
+                
+                transcription_text = "\n".join(combined_transcription)
+            else:
+                # Just use the existing full_transcription
+                transcription_text = "\n".join(full_transcription)
+            
+            # Try to store in global variable for force-save endpoint
+            try:
+                global last_transcription_text, last_call_sid
+                last_transcription_text = transcription_text
+                if stream_sid in call_mapping['stream_sid_to_call_sid']:
+                    last_call_sid = call_mapping['stream_sid_to_call_sid'][stream_sid]
+            except Exception as e:
+                logger.error(f"Error storing global transcription: {e}")
+            
+            logger.info(f"Call ended. Transcription ({len(full_transcription) + len(transcription_service.buffer)} messages):")
+            logger.info(f"--- TRANSCRIPTION START ---")
+            logger.info(transcription_text)
+            logger.info(f"--- TRANSCRIPTION END ---")
+            
+            # Save to a file as a fallback option
+            try:
+                import datetime
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"transcription_{timestamp}.txt"
+                
+                with open(filename, "w") as f:
+                    f.write(transcription_text)
+                
+                logger.info(f"Saved transcription to file: {filename}")
+            except Exception as file_error:
+                logger.error(f"Could not save transcription to file: {file_error}")
+            
+            # Try to save to Supabase if possible
+            if supabase_available:
+                try:
+                    # Try to find the matching call for this stream
+                    call_id = None
+                    
+                    # First check if we have a direct stream to call mapping
+                    if stream_sid and stream_sid in call_mapping['stream_sid_to_call_sid']:
+                        call_sid = call_mapping['stream_sid_to_call_sid'][stream_sid]
+                        logger.info(f"Found call SID {call_sid} for stream {stream_sid}")
+                        
+                        if call_sid in call_mapping['call_sid_to_info']:
+                            call_info = call_mapping['call_sid_to_info'][call_sid]
+                            call_id = call_info['call_id']
+                            logger.info(f"Found call record ID {call_id} for call SID {call_sid}")
+                    
+                    # If no direct mapping, try the most recent call
+                    if not call_id:
+                        recent_calls = []
+                        for call_sid, call_info in call_mapping['call_sid_to_info'].items():
+                            if 'call_id' in call_info and call_info['call_id'] != "dummy-call-id":
+                                recent_calls.append((call_info.get('timestamp', 0), call_info))
+                        
+                        if recent_calls:
+                            # Sort by timestamp and get the most recent
+                            recent_calls.sort(key=lambda x: x[0])
+                            call_info = recent_calls[-1][1]
+                            call_id = call_info['call_id']
+                            logger.info(f"Using most recent call with ID: {call_id}")
+                    
+                    if call_id:
+                        # Save the transcription
+                        transcription = await create_transcription(
+                            call_id=call_id,
+                            content=transcription_text
+                        )
+                        
+                        # Update the call record
+                        import datetime
+                        await update_call(
+                            call_id=call_id, 
+                            status="completed",
+                            ended_at=datetime.datetime.now().isoformat()
+                        )
+                        
+                        logger.info(f"Saved transcription to database for call ID: {call_id}")
+                    else:
+                        logger.warning("No matching call found in our mapping - transcription not saved to database")
+                except Exception as db_error:
+                    logger.error(f"Failed to save transcription to database: {db_error}")
+        
+        # Make sure everything is closed
+        if openai_ws.open:
+            await openai_ws.close()
 
 async def send_session_update(openai_ws):
     """Send session update to OpenAI WebSocket."""
