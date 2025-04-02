@@ -105,6 +105,9 @@ if not OPENAI_API_KEY:
 # Initialize Twilio client for outbound calls
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN else None
 
+# Global mapping to track stream SID to call SID and call record ID
+stream_to_call_mapping = {}
+
 @app.get("/", response_class=JSONResponse)
 async def index_page():
     return {"message": "Twilio Media Stream Server is running!"}
@@ -112,6 +115,13 @@ async def index_page():
 @app.api_route("/incoming-call", methods=["GET", "POST"])
 async def handle_incoming_call(request: Request):
     """Handle incoming call and return TwiML response to connect to Media Stream."""
+    # Get the Call SID from the request
+    form_data = await request.form()
+    call_sid = form_data.get('CallSid')
+    
+    if call_sid:
+        logger.info(f"Handling incoming call with SID: {call_sid}")
+    
     response = VoiceResponse()
     # <Say> punctuation to improve text-to-speech flow
     response.say("Please wait while we connect your call.")
@@ -119,7 +129,7 @@ async def handle_incoming_call(request: Request):
     response.say("OK you can start talking!")
     host = request.url.hostname
     connect = Connect()
-    connect.stream(url=f'wss://{host}/media-stream')
+    connect.stream(url=f'wss://{host}/media-stream?call_sid={call_sid}')
     response.append(connect)
     return HTMLResponse(content=str(response), media_type="application/xml")
 
@@ -183,6 +193,14 @@ async def call_user(request: Request):
                 # Now we can include call_sid as the parameter is supported
                 await update_call(call_id=db_call['id'], status="initiated", call_sid=call.sid)
                 logger.info(f"Updated call record with Twilio SID {call.sid}")
+                
+                # Store the call SID for later use in the WebSocket handler
+                # We'll use this to associate the stream with the call record
+                stream_to_call_mapping[call.sid] = {
+                    'call_id': db_call['id'],
+                    'user_id': user['id']
+                }
+                logger.info(f"Added call SID to stream mapping for future reference")
         except Exception as update_error:
             logger.error(f"Failed to update call record: {update_error}")
         
@@ -206,7 +224,20 @@ async def handle_media_stream(websocket: WebSocket):
     # Variables to track the call and collect transcription
     stream_sid = None
     call_record = None
+    call_sid = None
     full_transcription = []
+    
+    # Get call_sid from query parameters if available
+    query_params = websocket.query_params
+    if "call_sid" in query_params:
+        call_sid = query_params["call_sid"]
+        logger.info(f"WebSocket connection for call SID: {call_sid}")
+        
+        # If we have the call SID in our mapping, get the call record
+        if call_sid in stream_to_call_mapping:
+            call_info = stream_to_call_mapping[call_sid]
+            call_record = {"id": call_info['call_id'], "user_id": call_info['user_id']}
+            logger.info(f"Found call record from mapping: {call_record['id']}")
     
     async with websockets.connect(
         'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01',
@@ -219,7 +250,7 @@ async def handle_media_stream(websocket: WebSocket):
         
         async def receive_from_twilio():
             """Receive audio data from Twilio and send it to the OpenAI Realtime API."""
-            nonlocal stream_sid, call_record
+            nonlocal stream_sid, call_record, call_sid
             try:
                 async for message in websocket.iter_text():
                     data = json.loads(message)
@@ -233,25 +264,38 @@ async def handle_media_stream(websocket: WebSocket):
                         stream_sid = data['start']['streamSid']
                         logger.info(f"Incoming stream has started {stream_sid}")
                         
-                        # Try to find the call record based on the stream SID
-                        # This is a bit tricky since we don't have a direct mapping from stream_sid to call_sid
-                        # In a production app, you might want to pass additional parameters or use a different approach
+                        # If we don't have a call record yet, try to find it
+                        if not call_record and call_sid:
+                            try:
+                                db_call = await get_call_by_sid(call_sid)
+                                if db_call and db_call['id'] != "dummy-call-id":
+                                    call_record = db_call
+                                    logger.info(f"Retrieved call record with ID: {call_record['id']}")
+                            except Exception as e:
+                                logger.error(f"Error retrieving call record: {e}")
             except WebSocketDisconnect:
                 logger.info("Client disconnected from media stream")
                 
                 # Save the transcription if we have collected any text
-                if call_record and full_transcription:
+                if call_record and full_transcription and call_record['id'] != "dummy-call-id":
                     try:
                         transcription_text = "\n".join(full_transcription)
                         logger.info(f"Saving transcription of {len(full_transcription)} messages")
-                        await create_transcription(
+                        transcription = await create_transcription(
                             call_id=call_record['id'],
                             content=transcription_text
                         )
+                        logger.info(f"Saved transcription with ID: {transcription['id'] if transcription else 'unknown'}")
+                        
                         # Update call status to completed
                         await update_call(call_id=call_record['id'], status="completed")
+                        logger.info(f"Updated call status to completed")
                     except Exception as e:
                         logger.error(f"Error saving transcription: {e}")
+                elif not call_record or call_record['id'] == "dummy-call-id":
+                    logger.warning("No valid call record available - transcription not saved")
+                elif not full_transcription:
+                    logger.warning("No transcription collected - nothing to save")
                 
                 if openai_ws.open:
                     await openai_ws.close()
