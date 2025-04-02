@@ -105,8 +105,11 @@ if not OPENAI_API_KEY:
 # Initialize Twilio client for outbound calls
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN else None
 
-# Global mapping to track stream SID to call SID and call record ID
-stream_to_call_mapping = {}
+# Global mapping to track call and stream SIDs
+call_mapping = {
+    'call_sid_to_info': {},   # Maps Twilio call SID to call info
+    'stream_sid_to_call_sid': {}  # Maps Stream SID to Twilio call SID
+}
 
 @app.get("/", response_class=JSONResponse)
 async def index_page():
@@ -209,11 +212,12 @@ async def call_user(request: Request):
                 
                 # Store the call SID for later use in the WebSocket handler
                 # We'll use this to associate the stream with the call record
-                stream_to_call_mapping[call.sid] = {
+                call_mapping['call_sid_to_info'][call.sid] = {
                     'call_id': db_call['id'],
-                    'user_id': user['id']
+                    'user_id': user['id'],
+                    'timestamp': asyncio.get_event_loop().time()
                 }
-                logger.info(f"Added call SID to stream mapping for future reference")
+                logger.info(f"Added call SID {call.sid} to mapping for future reference")
         except Exception as update_error:
             logger.error(f"Failed to update call record: {update_error}")
         
@@ -236,7 +240,6 @@ async def handle_media_stream(websocket: WebSocket):
     
     # Variables to track the call and collect transcription
     stream_sid = None
-    # We won't try to associate with a call record for now, just focus on successful connection
     full_transcription = []
     
     # Create a timestamp for this session
@@ -267,10 +270,23 @@ async def handle_media_stream(websocket: WebSocket):
                     elif data['event'] == 'start':
                         stream_sid = data['start']['streamSid']
                         logger.info(f"Incoming stream has started {stream_sid}")
+                        
+                        # Try to associate this stream with a call
+                        # In Twilio, the CallSid is part of the parameters sent when the stream starts
+                        try:
+                            if 'start' in data and 'callSid' in data['start']:
+                                call_sid = data['start']['callSid']
+                                logger.info(f"Found Call SID {call_sid} in stream start event")
+                                
+                                # Add to our reverse mapping
+                                call_mapping['stream_sid_to_call_sid'][stream_sid] = call_sid
+                                logger.info(f"Associated stream {stream_sid} with call {call_sid}")
+                        except Exception as mapping_error:
+                            logger.error(f"Error mapping stream to call: {mapping_error}")
             except WebSocketDisconnect:
                 logger.info("Client disconnected from media stream")
                 
-                # Log the transcription even if we can't save it to a specific call
+                # Always log the transcription regardless of database storage
                 if full_transcription:
                     transcription_text = "\n".join(full_transcription)
                     logger.info(f"Call ended. Transcription ({len(full_transcription)} messages):")
@@ -278,9 +294,8 @@ async def handle_media_stream(websocket: WebSocket):
                     logger.info(transcription_text)
                     logger.info(f"--- TRANSCRIPTION END ---")
                     
-                    # Try to save to a file in case database is unavailable
+                    # Save to a file as a fallback option
                     try:
-                        # Save to a local file with timestamp
                         import datetime
                         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                         filename = f"transcription_{timestamp}.txt"
@@ -291,6 +306,56 @@ async def handle_media_stream(websocket: WebSocket):
                         logger.info(f"Saved transcription to file: {filename}")
                     except Exception as file_error:
                         logger.error(f"Could not save transcription to file: {file_error}")
+                    
+                    # Try to save to Supabase if possible
+                    if supabase_available:
+                        try:
+                            # Try to find the matching call for this stream
+                            call_id = None
+                            
+                            # First check if we have a direct stream to call mapping
+                            if stream_sid and stream_sid in call_mapping['stream_sid_to_call_sid']:
+                                call_sid = call_mapping['stream_sid_to_call_sid'][stream_sid]
+                                logger.info(f"Found call SID {call_sid} for stream {stream_sid}")
+                                
+                                if call_sid in call_mapping['call_sid_to_info']:
+                                    call_info = call_mapping['call_sid_to_info'][call_sid]
+                                    call_id = call_info['call_id']
+                                    logger.info(f"Found call record ID {call_id} for call SID {call_sid}")
+                            
+                            # If no direct mapping, try the most recent call
+                            if not call_id:
+                                recent_calls = []
+                                for call_sid, call_info in call_mapping['call_sid_to_info'].items():
+                                    if 'call_id' in call_info and call_info['call_id'] != "dummy-call-id":
+                                        recent_calls.append((call_info.get('timestamp', 0), call_info))
+                                
+                                if recent_calls:
+                                    # Sort by timestamp and get the most recent
+                                    recent_calls.sort(key=lambda x: x[0])
+                                    call_info = recent_calls[-1][1]
+                                    call_id = call_info['call_id']
+                                    logger.info(f"Using most recent call with ID: {call_id}")
+                            
+                            if call_id:
+                                # Save the transcription
+                                transcription = await create_transcription(
+                                    call_id=call_id,
+                                    content=transcription_text
+                                )
+                                
+                                # Update the call record
+                                await update_call(
+                                    call_id=call_id, 
+                                    status="completed",
+                                    ended_at=datetime.datetime.now().isoformat()
+                                )
+                                
+                                logger.info(f"Saved transcription to database for call ID: {call_id}")
+                            else:
+                                logger.warning("No matching call found in our mapping - transcription not saved to database")
+                        except Exception as db_error:
+                            logger.error(f"Failed to save transcription to database: {db_error}")
                 
                 if openai_ws.open:
                     await openai_ws.close()
