@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Calling Buddy</title>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Calling Buddy</h1>
+            <p class="subtitle">AI-powered voice assistant</p>
+        </header>
+
+        <main>
+            <div class="card">
+                <div class="card-header">
+                    <h2>Talk to Our AI Assistant</h2>
+                </div>
+                <div class="card-body">
+                    <p>Enter your phone number and our AI assistant will call you directly.</p>
+                    
+                    <div class="form-group">
+                        <label for="phoneNumber">Your Phone Number</label>
+                        <input type="tel" id="phoneNumber" placeholder="+1 (234) 567-8910" autocomplete="tel">
+                        <small>Include country code (e.g., +1 for US)</small>
+                    </div>
+                    
+                    <button id="callButton" class="btn btn-primary">
+                        <span class="btn-text">Get AI Call</span>
+                        <span class="spinner hidden"></span>
+                    </button>
+                    
+                    <div id="result" class="result hidden"></div>
+                </div>
+            </div>
+
+            <div class="info-section">
+                <h3>How It Works</h3>
+                <ol>
+                    <li>Enter your phone number with country code</li>
+                    <li>Click "Get AI Call" button</li>
+                    <li>Answer your phone when it rings</li>
+                    <li>Start talking with our AI assistant</li>
+                </ol>
+            </div>
+
+            <div class="log-container">
+                <h3>Request Logs</h3>
+                <div id="logs" class="logs"></div>
+            </div>
+        </main>
+
+        <footer>
+            <p>Powered by OpenAI's Realtime API and Twilio</p>
+            <p>© 2024 Calling Buddy</p>
+        </footer>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html> 
