@@ -3,6 +3,7 @@ import { StyleSheet, Text, View, TouchableOpacity, TextInput, Alert, ActivityInd
 import { useNavigation } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../App';
+import * as ExpoLinking from 'expo-linking';
 import axios from 'axios';
 import { TWILIO_PHONE_NUMBER, BACKEND_URL } from '../utils/config';
 
@@ -12,6 +13,7 @@ export default function CallScreen() {
   const navigation = useNavigation<CallScreenNavigationProp>();
   const [phoneNumber, setPhoneNumber] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   const initiateCall = async () => {
     // Simple validation
@@ -21,27 +23,65 @@ export default function CallScreen() {
     }
 
     setIsLoading(true);
+    setErrorMessage(null);
 
     try {
+      console.log(`Making request to: ${BACKEND_URL}/call-user`);
+      
       // Request the Twilio service to call your number
       const response = await axios.post(`${BACKEND_URL}/call-user`, {
         to: phoneNumber,
       });
 
+      console.log('Response:', response.data);
+      
       Alert.alert(
         'Call Initiated',
         'You will receive a call from our AI assistant shortly.',
         [{ text: 'OK' }]
       );
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error initiating call:', error);
+      
+      // Get more detailed error information
+      let errorMsg = 'There was a problem initiating the call.';
+      
+      if (axios.isAxiosError(error)) {
+        errorMsg += ` Status: ${error.response?.status || 'unknown'}`;
+        errorMsg += ` Message: ${error.message}`;
+        if (error.response?.data) {
+          errorMsg += ` Details: ${JSON.stringify(error.response.data)}`;
+        }
+      }
+      
+      setErrorMessage(errorMsg);
+      
       Alert.alert(
         'Error',
-        'There was a problem initiating the call. Please try again later.',
+        'There was a problem initiating the call. See error details below.',
         [{ text: 'OK' }]
       );
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  // Alternative method - direct call
+  const callDirectly = async () => {
+    try {
+      const telUrl = `tel:${TWILIO_PHONE_NUMBER}`;
+      const canOpen = await ExpoLinking.canOpenURL(telUrl);
+      
+      if (canOpen) {
+        await ExpoLinking.openURL(telUrl);
+      } else {
+        Alert.alert(
+          'Cannot Make Call',
+          'Your device cannot make phone calls. Try on a physical device.'
+        );
+      }
+    } catch (error) {
+      console.error('Error making direct call:', error);
     }
   };
 
@@ -78,9 +118,23 @@ export default function CallScreen() {
         )}
       </TouchableOpacity>
       
-      <Text style={styles.directCallText}>
-        Or call our assistant directly at: {TWILIO_PHONE_NUMBER}
-      </Text>
+      {errorMessage && (
+        <View style={styles.errorContainer}>
+          <Text style={styles.errorTitle}>Error Details:</Text>
+          <Text style={styles.errorText}>{errorMessage}</Text>
+        </View>
+      )}
+      
+      <Text style={styles.separatorText}>OR</Text>
+      
+      <TouchableOpacity 
+        style={[styles.callButton, styles.directCallButton]}
+        onPress={callDirectly}
+      >
+        <Text style={styles.directCallButtonText}>Call Directly: {TWILIO_PHONE_NUMBER}</Text>
+      </TouchableOpacity>
+      
+      <Text style={styles.debugText}>Backend URL: {BACKEND_URL}</Text>
     </View>
   );
 }
@@ -142,5 +196,45 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     color: '#777',
     fontSize: 15,
+  },
+  errorContainer: {
+    backgroundColor: '#ffebee',
+    padding: 10,
+    borderRadius: 5,
+    marginBottom: 20,
+    borderWidth: 1,
+    borderColor: '#ffcdd2',
+  },
+  errorTitle: {
+    color: '#d32f2f',
+    fontWeight: 'bold',
+    marginBottom: 5,
+  },
+  errorText: {
+    color: '#d32f2f',
+    fontSize: 12,
+  },
+  separatorText: {
+    textAlign: 'center',
+    color: '#777',
+    marginVertical: 10,
+    fontSize: 14,
+    fontWeight: 'bold',
+  },
+  directCallButton: {
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: '#3498db',
+  },
+  directCallButtonText: {
+    color: '#3498db',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  debugText: {
+    fontSize: 10,
+    color: '#aaa',
+    textAlign: 'center',
+    marginTop: 20,
   },
 }); 

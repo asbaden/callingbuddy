@@ -3,16 +3,21 @@ import json
 import base64
 import asyncio
 import websockets
-from fastapi import FastAPI, WebSocket, Request
+from fastapi import FastAPI, WebSocket, Request, Body
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.websockets import WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from twilio.twiml.voice_response import VoiceResponse, Connect, Say, Stream
+from twilio.rest import Client
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # Configuration
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')  # requires OpenAI Realtime API Access
+TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
+TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
+TWILIO_PHONE_NUMBER = os.getenv('TWILIO_PHONE_NUMBER')
 PORT = int(os.getenv('PORT', 5050))
 
 SYSTEM_MESSAGE = (
@@ -30,8 +35,20 @@ LOG_EVENT_TYPES = [
 
 app = FastAPI()
 
+# Add CORS middleware to allow requests from the mobile app
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, specify your app's domain
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 if not OPENAI_API_KEY:
     raise ValueError('Missing the OpenAI API key. Please set it in the .env file.')
+
+# Initialize Twilio client for outbound calls
+twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN else None
 
 @app.get("/", response_class=JSONResponse)
 async def index_page():
@@ -50,6 +67,47 @@ async def handle_incoming_call(request: Request):
     connect.stream(url=f'wss://{host}/media-stream')
     response.append(connect)
     return HTMLResponse(content=str(response), media_type="application/xml")
+
+@app.post("/call-user")
+async def call_user(request: Request):
+    """Initiate an outbound call to the user's phone number."""
+    try:
+        # Parse the request body
+        data = await request.json()
+        to_number = data.get('to')
+        
+        if not to_number:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Missing 'to' parameter with the phone number to call"}
+            )
+            
+        if not twilio_client:
+            return JSONResponse(
+                status_code=500,
+                content={"error": "Twilio client not configured. Check your environment variables."}
+            )
+        
+        # Create the URL for the TwiML that will be executed when the call connects
+        callback_url = f"https://{request.url.hostname}/incoming-call"
+        
+        # Make the call
+        call = twilio_client.calls.create(
+            to=to_number,
+            from_=TWILIO_PHONE_NUMBER,
+            url=callback_url,
+            method="POST"
+        )
+        
+        return JSONResponse(
+            status_code=200,
+            content={"success": True, "message": "Call initiated", "call_sid": call.sid}
+        )
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Failed to initiate call: {str(e)}"}
+        )
 
 @app.websocket("/media-stream")
 async def handle_media_stream(websocket: WebSocket):
