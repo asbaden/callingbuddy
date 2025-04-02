@@ -3,7 +3,7 @@ import { StyleSheet, Text, View, TouchableOpacity, TextInput, Alert, ActivityInd
 import { useNavigation } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../App';
-import { BACKEND_URL } from '../utils/config';
+import { BACKEND_URL, NETWORK_CONFIG } from '../utils/config';
 
 type CallScreenNavigationProp = NativeStackNavigationProp<RootStackParamList, 'Call'>;
 
@@ -15,131 +15,96 @@ export default function CallScreen() {
   const [serverStatus, setServerStatus] = useState<'unknown' | 'up' | 'down'>('unknown');
   const [debugInfo, setDebugInfo] = useState<string[]>([]);
   const [showDebug, setShowDebug] = useState(false);
+  const [retryCount, setRetryCount] = useState(0);
 
   // Add debug log
   const addDebugLog = (message: string) => {
-    setDebugInfo(prev => [...prev, `${new Date().toISOString().substring(11, 19)}: ${message}`]);
+    const timestamp = new Date().toISOString().substring(11, 19);
+    console.log(`${timestamp}: ${message}`);
+    setDebugInfo(prev => [...prev, `${timestamp}: ${message}`]);
   };
 
   // Check server status on component mount
   useEffect(() => {
-    const checkServer = async () => {
-      addDebugLog(`Checking server at ${BACKEND_URL}`);
-      try {
-        // First try
-        addDebugLog(`Using fetch GET`);
-        try {
-          const response = await fetch(`${BACKEND_URL}/`, { 
-            method: 'GET',
-            headers: { 'Accept': 'application/json' },
-          });
-          if (response.ok) {
-            const data = await response.json();
-            addDebugLog(`Server is up! Response: ${JSON.stringify(data)}`);
-            setServerStatus('up');
-            return;
-          } else {
-            addDebugLog(`Server returned error: ${response.status}`);
-          }
-        } catch (fetchError) {
-          addDebugLog(`Fetch error: ${fetchError}`);
-        }
+    checkServerStatus();
+  }, []);
 
-        // Try with XMLHttpRequest as fallback
-        addDebugLog(`Trying XMLHttpRequest`);
-        return new Promise<void>((resolve) => {
-          const xhr = new XMLHttpRequest();
-          xhr.onreadystatechange = function() {
-            if (xhr.readyState === 4) {
-              if (xhr.status === 200) {
-                addDebugLog(`XMLHttpRequest success: ${xhr.responseText}`);
-                setServerStatus('up');
-              } else {
-                addDebugLog(`XMLHttpRequest failed: ${xhr.status}`);
-                setServerStatus('down');
-              }
-              resolve();
-            }
-          };
-          xhr.onerror = function() {
-            addDebugLog('XMLHttpRequest network error');
-            setServerStatus('down');
-            resolve();
-          };
-          xhr.open('GET', `${BACKEND_URL}/`);
-          xhr.send();
-        });
-      } catch (error) {
-        addDebugLog(`Error checking server: ${error}`);
+  // Function to retry a fetch request
+  const fetchWithRetry = async (url: string, options: RequestInit, retriesLeft = NETWORK_CONFIG.maxRetries) => {
+    addDebugLog(`Fetching ${url} with ${retriesLeft} retries left`);
+    
+    try {
+      const response = await fetch(url, {
+        ...options,
+        // Set a longer timeout using AbortController
+        signal: AbortSignal.timeout(NETWORK_CONFIG.timeout),
+      });
+      
+      addDebugLog(`Response status: ${response.status}`);
+      return response;
+    } catch (error: any) {
+      addDebugLog(`Fetch error: ${error.message}`);
+      
+      if (retriesLeft <= 0) {
+        addDebugLog('No retries left, throwing error');
+        throw error;
+      }
+      
+      addDebugLog(`Retrying in ${NETWORK_CONFIG.retryDelay}ms...`);
+      await new Promise(resolve => setTimeout(resolve, NETWORK_CONFIG.retryDelay));
+      
+      setRetryCount(prev => prev + 1);
+      return fetchWithRetry(url, options, retriesLeft - 1);
+    }
+  };
+
+  const checkServerStatus = async () => {
+    addDebugLog(`Checking server at ${BACKEND_URL}`);
+    try {
+      const response = await fetchWithRetry(`${BACKEND_URL}/`, { 
+        method: 'GET',
+        headers: { 'Accept': 'application/json' },
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        addDebugLog(`Server is up! Response: ${JSON.stringify(data)}`);
+        setServerStatus('up');
+      } else {
+        addDebugLog(`Server returned error: ${response.status}`);
         setServerStatus('down');
       }
-    };
-    
-    checkServer();
-  }, []);
+    } catch (error: any) {
+      addDebugLog(`Final error checking server: ${error.message}`);
+      setServerStatus('down');
+    }
+  };
 
   const testEndpoint = async () => {
     setIsLoading(true);
+    setRetryCount(0);
     addDebugLog(`Testing endpoint: ${BACKEND_URL}/call-user`);
 
-    // Try different approaches
     try {
-      // 1. Try fetch
-      addDebugLog('Trying fetch POST...');
-      try {
-        const fetchResponse = await fetch(`${BACKEND_URL}/call-user`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({ to: '+1234567890' }), // Test number
-        });
-        
-        addDebugLog(`Fetch status: ${fetchResponse.status}`);
-        const textResponse = await fetchResponse.text();
-        addDebugLog(`Fetch response: ${textResponse}`);
-        
-        Alert.alert('Endpoint Test', `The endpoint responded with status: ${fetchResponse.status}\n\nResponse: ${textResponse}`);
-        return;
-      } catch (fetchError) {
-        addDebugLog(`Fetch error: ${fetchError}`);
-      }
-
-      // 2. Try XMLHttpRequest
-      addDebugLog('Trying XMLHttpRequest...');
-      return new Promise<void>((resolve) => {
-        const xhr = new XMLHttpRequest();
-        xhr.onreadystatechange = function() {
-          if (xhr.readyState === 4) {
-            addDebugLog(`XHR complete: status ${xhr.status}`);
-            if (xhr.responseText) {
-              addDebugLog(`XHR response: ${xhr.responseText}`);
-            }
-            Alert.alert('XHR Test', `Status: ${xhr.status}\nResponse: ${xhr.responseText || 'None'}`);
-            resolve();
-          }
-        };
-        
-        xhr.onerror = function() {
-          addDebugLog('XHR error event fired');
-          Alert.alert('XHR Test', 'Network error occurred');
-          resolve();
-        };
-        
-        xhr.timeout = 10000;
-        xhr.ontimeout = function() {
-          addDebugLog('XHR timeout');
-          Alert.alert('XHR Test', 'Request timed out');
-          resolve();
-        };
-        
-        xhr.open('POST', `${BACKEND_URL}/call-user`);
-        xhr.setRequestHeader('Content-Type', 'application/json');
-        xhr.send(JSON.stringify({ to: '+1234567890' }));
+      const response = await fetchWithRetry(`${BACKEND_URL}/call-user`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ to: '+1234567890' }), // Test number
       });
-    } catch (error) {
-      addDebugLog(`Overall test error: ${error}`);
-      Alert.alert('Test Error', `An error occurred: ${error}`);
+      
+      const textResponse = await response.text();
+      addDebugLog(`Response: ${textResponse}`);
+      
+      Alert.alert('Endpoint Test', 
+        `Status: ${response.status}\n\nResponse: ${textResponse}\n\nRetries: ${retryCount}`
+      );
+    } catch (error: any) {
+      addDebugLog(`Final test error: ${error.message}`);
+      Alert.alert('Test Error', 
+        `Error: ${error.message}\n\nRetries attempted: ${retryCount}`
+      );
     } finally {
       setIsLoading(false);
     }
@@ -154,13 +119,13 @@ export default function CallScreen() {
 
     setIsLoading(true);
     setErrorMessage(null);
+    setRetryCount(0);
     addDebugLog(`Initiating call to: ${phoneNumber}`);
 
     try {
       addDebugLog(`Making request to: ${BACKEND_URL}/call-user`);
       
-      // Using fetch API
-      const response = await fetch(`${BACKEND_URL}/call-user`, {
+      const response = await fetchWithRetry(`${BACKEND_URL}/call-user`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -169,12 +134,10 @@ export default function CallScreen() {
         body: JSON.stringify({ to: phoneNumber }),
       });
       
-      addDebugLog(`Response status: ${response.status}`);
-      
       if (!response.ok) {
         const errorText = await response.text();
         addDebugLog(`Error response: ${errorText}`);
-        throw new Error(`Server returned ${response.status}: ${response.statusText}`);
+        throw new Error(`Server returned ${response.status}: ${errorText}`);
       }
       
       const data = await response.json();
@@ -182,7 +145,7 @@ export default function CallScreen() {
       
       Alert.alert(
         'Call Initiated',
-        'You will receive a call from our AI assistant shortly.',
+        `You will receive a call from our AI assistant shortly.\n\n${retryCount > 0 ? `(Required ${retryCount} retries)` : ''}`,
         [{ text: 'OK' }]
       );
     } catch (error: any) {
@@ -192,6 +155,9 @@ export default function CallScreen() {
       let errorMsg = 'There was a problem initiating the call.';
       if (error.message) {
         errorMsg += ` Error: ${error.message}`;
+      }
+      if (retryCount > 0) {
+        errorMsg += `\n\nRetries attempted: ${retryCount}`;
       }
       
       setErrorMessage(errorMsg);
@@ -227,6 +193,14 @@ export default function CallScreen() {
             serverStatus === 'up' ? 'Online ✅' : 'Offline ❌'
           }
         </Text>
+        {serverStatus === 'down' && (
+          <TouchableOpacity 
+            style={styles.retryButton}
+            onPress={checkServerStatus}
+          >
+            <Text style={styles.retryButtonText}>Retry</Text>
+          </TouchableOpacity>
+        )}
       </View>
       
       <View style={styles.inputContainer}>
@@ -251,7 +225,12 @@ export default function CallScreen() {
         disabled={isLoading || serverStatus === 'down'}
       >
         {isLoading ? (
-          <ActivityIndicator color="#fff" />
+          <View style={styles.loadingContainer}>
+            <ActivityIndicator color="#fff" />
+            {retryCount > 0 && (
+              <Text style={styles.retryText}>Retry #{retryCount}...</Text>
+            )}
+          </View>
         ) : (
           <Text style={styles.callButtonText}>Request AI Call</Text>
         )}
@@ -268,6 +247,7 @@ export default function CallScreen() {
         <TouchableOpacity 
           style={styles.debugButton}
           onPress={testEndpoint}
+          disabled={isLoading}
         >
           <Text style={styles.debugButtonText}>Test Endpoint</Text>
         </TouchableOpacity>
@@ -286,6 +266,7 @@ export default function CallScreen() {
         <View style={styles.debugContainer}>
           <Text style={styles.debugTitle}>Debug Logs:</Text>
           <Text style={styles.debugUrl}>Backend URL: {BACKEND_URL}</Text>
+          <Text style={styles.debugUrl}>Timeout: {NETWORK_CONFIG.timeout}ms, Max Retries: {NETWORK_CONFIG.maxRetries}</Text>
           {debugInfo.map((log, index) => (
             <Text key={index} style={styles.debugLog}>{log}</Text>
           ))}
@@ -296,7 +277,7 @@ export default function CallScreen() {
       <View style={styles.noteContainer}>
         <Text style={styles.noteText}>• First response may take a few seconds</Text>
         <Text style={styles.noteText}>• Make sure your phone number is correct</Text>
-        <Text style={styles.noteText}>• Using a physical device may work better than the simulator</Text>
+        <Text style={styles.noteText}>• The app will automatically retry if network issues occur</Text>
       </View>
     </ScrollView>
   );
@@ -346,11 +327,25 @@ const styles = StyleSheet.create({
     marginBottom: 20,
     marginHorizontal: 20,
     alignItems: 'center',
+    flexDirection: 'row',
+    justifyContent: 'center',
   },
   serverStatusText: {
     fontSize: 15,
     fontWeight: '600',
     color: '#3498db',
+  },
+  retryButton: {
+    backgroundColor: '#3498db',
+    paddingHorizontal: 12,
+    paddingVertical: 4,
+    borderRadius: 4,
+    marginLeft: 10,
+  },
+  retryButtonText: {
+    color: '#fff',
+    fontSize: 12,
+    fontWeight: '600',
   },
   inputContainer: {
     marginBottom: 25,
@@ -394,6 +389,15 @@ const styles = StyleSheet.create({
     color: 'white',
     fontSize: 18,
     fontWeight: '600',
+  },
+  loadingContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  retryText: {
+    color: '#fff',
+    marginLeft: 10,
+    fontSize: 14,
   },
   errorContainer: {
     backgroundColor: '#ffebee',
