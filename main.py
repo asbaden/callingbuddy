@@ -115,22 +115,35 @@ async def index_page():
 @app.api_route("/incoming-call", methods=["GET", "POST"])
 async def handle_incoming_call(request: Request):
     """Handle incoming call and return TwiML response to connect to Media Stream."""
-    # Get the Call SID from the request
-    form_data = await request.form()
-    call_sid = form_data.get('CallSid')
+    # Log raw request information for debugging
+    logger.info(f"Incoming call request: method={request.method}, headers={request.headers}")
     
-    if call_sid:
-        logger.info(f"Handling incoming call with SID: {call_sid}")
+    # For Twilio calls, we'll proceed without requiring the CallSid
+    # The important part is returning valid TwiML
     
+    # Build the TwiML response
     response = VoiceResponse()
+    
     # <Say> punctuation to improve text-to-speech flow
     response.say("Please wait while we connect your call.")
     response.pause(length=1)
     response.say("OK you can start talking!")
+    
+    # Create the connection
     host = request.url.hostname
     connect = Connect()
-    connect.stream(url=f'wss://{host}/media-stream?call_sid={call_sid}')
+    
+    # Simple stream URL without parameters
+    stream_url = f'wss://{host}/media-stream'
+    
+    # Log the stream URL
+    logger.info(f"Creating stream connection to: {stream_url}")
+    
+    # Add the stream to the Connect verb
+    connect.stream(url=stream_url)
     response.append(connect)
+    
+    # Return the TwiML
     return HTMLResponse(content=str(response), media_type="application/xml")
 
 @app.post("/call-user")
@@ -223,21 +236,12 @@ async def handle_media_stream(websocket: WebSocket):
     
     # Variables to track the call and collect transcription
     stream_sid = None
-    call_record = None
-    call_sid = None
+    # We won't try to associate with a call record for now, just focus on successful connection
     full_transcription = []
     
-    # Get call_sid from query parameters if available
-    query_params = websocket.query_params
-    if "call_sid" in query_params:
-        call_sid = query_params["call_sid"]
-        logger.info(f"WebSocket connection for call SID: {call_sid}")
-        
-        # If we have the call SID in our mapping, get the call record
-        if call_sid in stream_to_call_mapping:
-            call_info = stream_to_call_mapping[call_sid]
-            call_record = {"id": call_info['call_id'], "user_id": call_info['user_id']}
-            logger.info(f"Found call record from mapping: {call_record['id']}")
+    # Create a timestamp for this session
+    session_timestamp = asyncio.get_event_loop().time()
+    logger.info(f"Starting new session at timestamp: {session_timestamp}")
     
     async with websockets.connect(
         'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01',
@@ -250,7 +254,7 @@ async def handle_media_stream(websocket: WebSocket):
         
         async def receive_from_twilio():
             """Receive audio data from Twilio and send it to the OpenAI Realtime API."""
-            nonlocal stream_sid, call_record, call_sid
+            nonlocal stream_sid
             try:
                 async for message in websocket.iter_text():
                     data = json.loads(message)
@@ -263,39 +267,30 @@ async def handle_media_stream(websocket: WebSocket):
                     elif data['event'] == 'start':
                         stream_sid = data['start']['streamSid']
                         logger.info(f"Incoming stream has started {stream_sid}")
-                        
-                        # If we don't have a call record yet, try to find it
-                        if not call_record and call_sid:
-                            try:
-                                db_call = await get_call_by_sid(call_sid)
-                                if db_call and db_call['id'] != "dummy-call-id":
-                                    call_record = db_call
-                                    logger.info(f"Retrieved call record with ID: {call_record['id']}")
-                            except Exception as e:
-                                logger.error(f"Error retrieving call record: {e}")
             except WebSocketDisconnect:
                 logger.info("Client disconnected from media stream")
                 
-                # Save the transcription if we have collected any text
-                if call_record and full_transcription and call_record['id'] != "dummy-call-id":
+                # Log the transcription even if we can't save it to a specific call
+                if full_transcription:
+                    transcription_text = "\n".join(full_transcription)
+                    logger.info(f"Call ended. Transcription ({len(full_transcription)} messages):")
+                    logger.info(f"--- TRANSCRIPTION START ---")
+                    logger.info(transcription_text)
+                    logger.info(f"--- TRANSCRIPTION END ---")
+                    
+                    # Try to save to a file in case database is unavailable
                     try:
-                        transcription_text = "\n".join(full_transcription)
-                        logger.info(f"Saving transcription of {len(full_transcription)} messages")
-                        transcription = await create_transcription(
-                            call_id=call_record['id'],
-                            content=transcription_text
-                        )
-                        logger.info(f"Saved transcription with ID: {transcription['id'] if transcription else 'unknown'}")
+                        # Save to a local file with timestamp
+                        import datetime
+                        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                        filename = f"transcription_{timestamp}.txt"
                         
-                        # Update call status to completed
-                        await update_call(call_id=call_record['id'], status="completed")
-                        logger.info(f"Updated call status to completed")
-                    except Exception as e:
-                        logger.error(f"Error saving transcription: {e}")
-                elif not call_record or call_record['id'] == "dummy-call-id":
-                    logger.warning("No valid call record available - transcription not saved")
-                elif not full_transcription:
-                    logger.warning("No transcription collected - nothing to save")
+                        with open(filename, "w") as f:
+                            f.write(transcription_text)
+                        
+                        logger.info(f"Saved transcription to file: {filename}")
+                    except Exception as file_error:
+                        logger.error(f"Could not save transcription to file: {file_error}")
                 
                 if openai_ws.open:
                     await openai_ws.close()
@@ -341,17 +336,13 @@ async def handle_media_stream(websocket: WebSocket):
             except Exception as e:
                 logger.error(f"Error in send_to_twilio: {e}")
                 
-                # Try to save any collected transcription before exiting
-                if call_record and full_transcription:
-                    try:
-                        transcription_text = "\n".join(full_transcription)
-                        logger.info(f"Saving transcription on error: {len(full_transcription)} messages")
-                        await create_transcription(
-                            call_id=call_record['id'],
-                            content=transcription_text
-                        )
-                    except Exception as save_error:
-                        logger.error(f"Error saving transcription on error: {save_error}")
+                # Log the transcription even if we can't save it properly
+                if full_transcription:
+                    transcription_text = "\n".join(full_transcription)
+                    logger.info(f"Error occurred. Transcription so far ({len(full_transcription)} messages):")
+                    logger.info(f"--- TRANSCRIPTION START ---")
+                    logger.info(transcription_text)
+                    logger.info(f"--- TRANSCRIPTION END ---")
 
         await asyncio.gather(receive_from_twilio(), send_to_twilio())
 
