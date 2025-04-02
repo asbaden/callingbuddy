@@ -112,9 +112,223 @@ call_mapping = {
 }
 
 # Global variables for transcription session
-transcription_ws = None
-transcription_buffer = []
-async_transcription_task = None
+class TranscriptionService:
+    """A service to manage a transcription session with proper state handling."""
+    
+    def __init__(self):
+        self.ws = None
+        self.buffer = []
+        self.audio_queue = asyncio.Queue()
+        self.processing_task = None
+        self.sending_task = None
+        self.lock = asyncio.Lock()  # Prevent multiple simultaneous session creations
+        self.state = "closed"       # States: closed, initializing, ready, error
+        self.error_count = 0
+        self.max_errors = 3
+    
+    async def start(self):
+        """Start the transcription service if it's not already running."""
+        async with self.lock:
+            if self.state != "closed":
+                logger.info(f"Transcription service already in state: {self.state}")
+                return
+                
+            self.state = "initializing"
+            try:
+                # Create WebSocket connection
+                logger.info("Creating new transcription session with OpenAI")
+                self.ws = await websockets.connect(
+                    'wss://api.openai.com/v1/realtime?model=whisper-1',
+                    extra_headers={
+                        "Authorization": f"Bearer {OPENAI_API_KEY}",
+                        "OpenAI-Beta": "realtime=v1"
+                    },
+                    ping_interval=20,
+                    ping_timeout=10
+                )
+                
+                # Configure transcription session
+                session_config = {
+                    "type": "session.update",
+                    "session": {
+                        "input_audio_format": "g711_ulaw",
+                        "input_audio_transcription": {
+                            "model": "whisper-1",
+                            "language": "en"
+                        }
+                    }
+                }
+                
+                await self.ws.send(json.dumps(session_config))
+                logger.info("Transcription session configured")
+                
+                # Wait for confirmation
+                try:
+                    response = await asyncio.wait_for(self.ws.recv(), timeout=5)
+                    logger.info(f"Transcription session response: {response}")
+                    
+                    # Start the processing tasks if not already running
+                    if not self.processing_task or self.processing_task.done():
+                        self.processing_task = asyncio.create_task(self._process_results())
+                        logger.info("Started transcription results processing task")
+                        
+                    if not self.sending_task or self.sending_task.done():
+                        self.sending_task = asyncio.create_task(self._process_audio_queue())
+                        logger.info("Started audio queue processing task")
+                    
+                    self.state = "ready"
+                    return True
+                except asyncio.TimeoutError:
+                    logger.warning("No immediate response from transcription session")
+                    self.state = "error"
+                    return False
+            except Exception as e:
+                logger.error(f"Failed to create transcription session: {str(e)}")
+                import traceback
+                logger.error(traceback.format_exc())
+                self.state = "error"
+                return False
+    
+    async def stop(self):
+        """Stop the transcription service cleanly."""
+        async with self.lock:
+            if self.state == "closed":
+                return
+                
+            logger.info("Stopping transcription service")
+            
+            # Cancel tasks
+            if self.processing_task and not self.processing_task.done():
+                self.processing_task.cancel()
+                logger.info("Cancelled processing task")
+                
+            if self.sending_task and not self.sending_task.done():
+                self.sending_task.cancel()
+                logger.info("Cancelled sending task")
+            
+            # Close WebSocket
+            if self.ws:
+                try:
+                    await self.ws.close()
+                    logger.info("Closed transcription WebSocket")
+                except Exception as e:
+                    logger.error(f"Error closing WebSocket: {str(e)}")
+            
+            self.state = "closed"
+            self.error_count = 0
+    
+    async def send_audio(self, audio_data):
+        """Queue audio data to be sent to the transcription service."""
+        # Start the service if needed
+        if self.state == "closed":
+            success = await self.start()
+            if not success:
+                logger.error("Failed to start transcription service")
+                return False
+        
+        # Handle error state with retries
+        if self.state == "error":
+            self.error_count += 1
+            if self.error_count > self.max_errors:
+                logger.error(f"Too many errors ({self.error_count}), stopping transcription service")
+                await self.stop()
+                return False
+                
+            # Try to restart
+            logger.info(f"Attempting to recover transcription service (attempt {self.error_count})")
+            await self.stop()
+            success = await self.start()
+            if not success:
+                return False
+        
+        # Add to the queue - non-blocking
+        await self.audio_queue.put(audio_data)
+        return True
+    
+    async def _process_audio_queue(self):
+        """Process the audio queue and send to the transcription service."""
+        try:
+            while True:
+                # Wait for audio data
+                audio_data = await self.audio_queue.get()
+                
+                if self.state != "ready" or not self.ws or not self.ws.open:
+                    logger.warning(f"Cannot send audio in state: {self.state}")
+                    self.audio_queue.task_done()
+                    continue
+                
+                try:
+                    # Send the audio data
+                    audio_message = {
+                        "type": "audio",
+                        "data": audio_data
+                    }
+                    await self.ws.send(json.dumps(audio_message))
+                    self.audio_queue.task_done()
+                except Exception as e:
+                    logger.error(f"Error sending audio: {str(e)}")
+                    self.state = "error"
+                    self.audio_queue.task_done()
+        except asyncio.CancelledError:
+            logger.info("Audio queue processing task was cancelled")
+            raise
+        except Exception as e:
+            logger.error(f"Error in audio queue processing: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            self.state = "error"
+    
+    async def _process_results(self):
+        """Process transcription results from the WebSocket."""
+        try:
+            if not self.ws or not self.ws.open:
+                logger.error("WebSocket not available for processing results")
+                self.state = "error"
+                return
+                
+            async for message in self.ws:
+                try:
+                    response = json.loads(message)
+                    logger.info(f"Transcription event: {response['type']}")
+                    
+                    # Handle different types of transcription responses
+                    if response['type'] == 'transcription.parts':
+                        text = response.get('text', '')
+                        if text:
+                            logger.info(f"Partial transcription: {text}")
+                            self.buffer.append(f"User: {text}")
+                    
+                    elif response['type'] == 'transcription.completed':
+                        final_text = response.get('text', '')
+                        if final_text:
+                            logger.info(f"Completed transcription: {final_text}")
+                            # Replace the last partial with the complete transcription
+                            if self.buffer and self.buffer[-1].startswith("User: "):
+                                self.buffer[-1] = f"User: {final_text}"
+                            else:
+                                self.buffer.append(f"User: {final_text}")
+                except Exception as parse_error:
+                    logger.error(f"Error parsing transcription message: {str(parse_error)}")
+        except asyncio.CancelledError:
+            logger.info("Transcription processing task was cancelled")
+            raise
+        except Exception as e:
+            logger.error(f"Error processing transcription results: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            self.state = "error"
+
+    async def get_buffer(self):
+        """Get a copy of the current transcription buffer."""
+        return self.buffer.copy()
+        
+    def clear_buffer(self):
+        """Clear the transcription buffer."""
+        self.buffer = []
+        return True
+
+# Initialize the transcription service
+transcription_service = TranscriptionService()
 
 @app.get("/", response_class=JSONResponse)
 async def index_page():
@@ -277,7 +491,7 @@ async def handle_media_stream(websocket: WebSocket):
                         
                         # Also send to transcription service (new functionality)
                         try:
-                            # Don't await this to avoid blocking the main flow
+                            # Send audio to transcription service (non-blocking)
                             asyncio.create_task(send_audio_for_transcription(data['media']['payload']))
                         except Exception as transcription_error:
                             # Log but don't interrupt the main conversation flow
@@ -303,32 +517,27 @@ async def handle_media_stream(websocket: WebSocket):
                 logger.info("Client disconnected from media stream")
                 
                 # Stop the transcription session if it's running
-                global transcription_ws, transcription_buffer, async_transcription_task
-                if transcription_ws and transcription_ws.open:
+                global transcription_service
+                if transcription_service.state != "closed":
                     try:
-                        await transcription_ws.close()
+                        await transcription_service.stop()
                         logger.info("Closed transcription session")
                     except Exception as e:
                         logger.error(f"Error closing transcription session: {str(e)}")
                 
-                # Cancel the async task if it's still running
-                if async_transcription_task and not async_transcription_task.done():
-                    async_transcription_task.cancel()
-                    logger.info("Cancelled transcription task")
-                
                 # Log the transcription even if we can't save it to a specific call
-                if full_transcription or transcription_buffer:
+                if full_transcription or transcription_service.buffer:
                     # Merge the transcription buffer with the full transcription
-                    if transcription_buffer:
-                        logger.info(f"Adding {len(transcription_buffer)} items from transcription buffer")
+                    if transcription_service.buffer:
+                        logger.info(f"Adding {len(transcription_service.buffer)} items from transcription buffer")
                         # Combine both transcription sources
                         combined_transcription = []
                         
                         # Simple merge - in a real app, you might want to timestamp and order them properly
                         if full_transcription:
                             combined_transcription.extend(full_transcription)
-                        if transcription_buffer:
-                            combined_transcription.extend(transcription_buffer)
+                        if transcription_service.buffer:
+                            combined_transcription.extend(transcription_service.buffer)
                         
                         transcription_text = "\n".join(combined_transcription)
                     else:
@@ -341,7 +550,7 @@ async def handle_media_stream(websocket: WebSocket):
                     if stream_sid in call_mapping['stream_sid_to_call_sid']:
                         last_call_sid = call_mapping['stream_sid_to_call_sid'][stream_sid]
                     
-                    logger.info(f"Call ended. Transcription ({len(full_transcription) + len(transcription_buffer)} messages):")
+                    logger.info(f"Call ended. Transcription ({len(full_transcription) + len(transcription_service.buffer)} messages):")
                     logger.info(f"--- TRANSCRIPTION START ---")
                     logger.info(transcription_text)
                     logger.info(f"--- TRANSCRIPTION END ---")
@@ -616,157 +825,56 @@ async def debug_key_format():
     
     return JSONResponse(content=results)
 
-async def create_transcription_session():
-    """Create a separate WebSocket connection to OpenAI for transcription only."""
-    global transcription_ws
-    
-    if transcription_ws is not None and transcription_ws.open:
-        logger.info("Transcription session already exists")
-        return transcription_ws
-    
-    try:
-        logger.info("Creating new transcription session with OpenAI")
-        transcription_ws = await websockets.connect(
-            'wss://api.openai.com/v1/realtime?model=whisper-1',
-            extra_headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "OpenAI-Beta": "realtime=v1"
-            },
-            ping_interval=20,
-            ping_timeout=10
-        )
-        
-        # Configure transcription session
-        session_config = {
-            "type": "session.update",
-            "session": {
-                "input_audio_format": "g711_ulaw",
-                "input_audio_transcription": {
-                    "model": "whisper-1",
-                    "language": "en"
-                }
-            }
-        }
-        
-        await transcription_ws.send(json.dumps(session_config))
-        logger.info("Transcription session configured")
-        
-        # Wait for confirmation
-        try:
-            response = await asyncio.wait_for(transcription_ws.recv(), timeout=5)
-            logger.info(f"Transcription session response: {response}")
-        except asyncio.TimeoutError:
-            logger.warning("No immediate response from transcription session")
-        
-        return transcription_ws
-    except Exception as e:
-        logger.error(f"Failed to create transcription session: {str(e)}")
-        transcription_ws = None
-        return None
-
-async def process_transcription_results():
-    """Process transcription results from OpenAI."""
-    global transcription_ws, transcription_buffer
-    
-    if transcription_ws is None or not transcription_ws.open:
-        logger.warning("No active transcription session")
-        return
-    
-    try:
-        async for message in transcription_ws:
-            try:
-                response = json.loads(message)
-                logger.info(f"Transcription event: {response['type']}")
-                
-                # Handle different types of transcription responses
-                if response['type'] == 'transcription.parts':
-                    text = response.get('text', '')
-                    if text:
-                        logger.info(f"Partial transcription: {text}")
-                        transcription_buffer.append(f"User: {text}")
-                
-                elif response['type'] == 'transcription.completed':
-                    final_text = response.get('text', '')
-                    if final_text:
-                        logger.info(f"Completed transcription: {final_text}")
-                        # Replace the last partial with the complete transcription
-                        if transcription_buffer and transcription_buffer[-1].startswith("User: "):
-                            transcription_buffer[-1] = f"User: {final_text}"
-                        else:
-                            transcription_buffer.append(f"User: {final_text}")
-            except Exception as parse_error:
-                logger.error(f"Error parsing transcription message: {str(parse_error)}")
-    except Exception as e:
-        logger.error(f"Error processing transcription results: {str(e)}")
-        if transcription_ws and transcription_ws.open:
-            await transcription_ws.close()
-            
 async def send_audio_for_transcription(audio_data):
     """Send audio data to the transcription service."""
-    global transcription_ws
+    global transcription_service
     
-    if transcription_ws is None or not transcription_ws.open:
-        try:
-            transcription_ws = await create_transcription_session()
-            if transcription_ws is None:
-                return False
-            
-            # Start processing results in the background
-            global async_transcription_task
-            if async_transcription_task is None or async_transcription_task.done():
-                async_transcription_task = asyncio.create_task(process_transcription_results())
-        except Exception as e:
-            logger.error(f"Failed to initialize transcription: {str(e)}")
+    if transcription_service.state == "closed":
+        success = await transcription_service.start()
+        if not success:
+            logger.error("Failed to start transcription service")
             return False
     
-    try:
-        # Send the audio data
-        audio_message = {
-            "type": "audio",
-            "data": audio_data
-        }
-        await transcription_ws.send(json.dumps(audio_message))
-        return True
-    except Exception as e:
-        logger.error(f"Error sending audio for transcription: {str(e)}")
-        return False
+    return await transcription_service.send_audio(audio_data)
 
 @app.get("/test-transcription")
 async def test_transcription():
     """Test endpoint for the transcription functionality."""
-    global transcription_ws, transcription_buffer, async_transcription_task
+    global transcription_service
     
     # Clean up any existing session
-    if transcription_ws and transcription_ws.open:
-        await transcription_ws.close()
+    if transcription_service.state != "closed":
+        await transcription_service.stop()
     
-    if async_transcription_task and not async_transcription_task.done():
-        async_transcription_task.cancel()
-    
-    transcription_buffer = []
+    transcription_service.clear_buffer()
     
     # Create a new transcription session
     try:
-        transcription_ws = await create_transcription_session()
-        if not transcription_ws:
+        success = await transcription_service.start()
+        if not success:
             return JSONResponse(
                 status_code=500,
                 content={"error": "Failed to create transcription session"}
             )
         
-        # Start the processing task
-        async_transcription_task = asyncio.create_task(process_transcription_results())
-        
         # Send a test audio snippet (in a real scenario, this would be voice data)
         # This is just a placeholder - you would need real audio data
         test_audio = "VGVzdCBhdWRpbyBkYXRhIC0gbm90IHJlYWwgYXVkaW8="  # Base64 "Test audio data - not real audio"
-        success = await send_audio_for_transcription(test_audio)
+        success = await transcription_service.send_audio(test_audio)
+        
+        # Wait a moment to see if we get any response
+        await asyncio.sleep(2)
+        
+        # Get the current buffer
+        buffer = await transcription_service.get_buffer()
         
         return JSONResponse(
             status_code=200,
             content={
                 "status": "success" if success else "error",
-                "message": "Transcription test started. Check logs for results."
+                "message": "Transcription test completed",
+                "state": transcription_service.state,
+                "buffer": buffer
             }
         )
     except Exception as e:
