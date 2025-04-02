@@ -1,0 +1,36 @@
+# Environment variables
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+.python-version
+*.egg-info/
+.installed.cfg
+*.egg
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# VSCode
+.vscode/
+*.code-workspace
+.history/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log* 
