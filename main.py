@@ -140,7 +140,7 @@ class TranscriptionService:
                 try:
                     self.ws = await asyncio.wait_for(
                         websockets.connect(
-                            'wss://api.openai.com/v1/realtime?model=whisper-1',
+                            'wss://api.openai.com/v1/realtime/transcription?model=whisper-1',
                             extra_headers={
                                 "Authorization": f"Bearer {OPENAI_API_KEY}",
                                 "OpenAI-Beta": "realtime=v1"
@@ -161,12 +161,18 @@ class TranscriptionService:
                 
                 # Configure transcription session
                 session_config = {
-                    "type": "session.update",
+                    "type": "transcription_session.update",
                     "session": {
                         "input_audio_format": "g711_ulaw",
                         "input_audio_transcription": {
                             "model": "whisper-1",
                             "language": "en"
+                        },
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "threshold": 0.5,
+                            "prefix_padding_ms": 300,
+                            "silence_duration_ms": 200
                         }
                     }
                 }
@@ -349,6 +355,25 @@ class TranscriptionService:
                                     self.buffer[-1] = f"User: {final_text}"
                                 else:
                                     self.buffer.append(f"User: {final_text}")
+                        
+                        # Handle conversation.item.input_audio_transcription events (new format)
+                        elif response['type'] == 'conversation.item.input_audio_transcription.delta':
+                            delta = response.get('delta', '')
+                            if delta:
+                                logger.info(f"Transcription delta: {delta}")
+                                if self.buffer and self.buffer[-1].startswith("User: "):
+                                    self.buffer[-1] = f"User: {self.buffer[-1][6:] + delta}"
+                                else:
+                                    self.buffer.append(f"User: {delta}")
+                        
+                        elif response['type'] == 'conversation.item.input_audio_transcription.completed':
+                            transcript = response.get('transcript', '')
+                            if transcript:
+                                logger.info(f"Completed transcription: {transcript}")
+                                if self.buffer and self.buffer[-1].startswith("User: "):
+                                    self.buffer[-1] = f"User: {transcript}"
+                                else:
+                                    self.buffer.append(f"User: {transcript}")
                     except json.JSONDecodeError as json_error:
                         logger.error(f"Error parsing JSON from transcription message: {json_error}")
                     except Exception as parse_error:
