@@ -840,9 +840,9 @@ async def handle_media_stream(websocket: WebSocket):
             final_transcription = []
             
             # Process transcriptions from the OpenAI conversation API
-            if full_transcription:
+            has_real_time_transcripts = bool(full_transcription)
+            if has_real_time_transcripts:
                 logger.info(f"Adding {len(full_transcription)} items from real-time transcription")
-                final_transcription.extend(full_transcription)
             
             # Get transcriptions from our custom transcription service
             if transcription_service.buffer:
@@ -865,10 +865,41 @@ async def handle_media_stream(websocket: WebSocket):
                     # We have a single comprehensive transcription
                     consolidated_transcript = transcription_service.buffer[0]
                     logger.info(f"Using consolidated transcription: {consolidated_transcript}")
-                    final_transcription = [consolidated_transcript] + final_transcription
+                    
+                    # If we have real-time transcripts that include AI responses, we should preserve the conversational flow
+                    if has_real_time_transcripts:
+                        # Categorize messages by type for easier processing
+                        realtime_user_msgs = [msg for msg in full_transcription if msg.startswith("User:")]
+                        ai_msgs = [msg for msg in full_transcription if msg.startswith("AI:")]
+                        
+                        logger.info(f"Found {len(realtime_user_msgs)} user messages and {len(ai_msgs)} AI messages from real-time API")
+                        
+                        # If we have AI messages, create a proper conversation flow
+                        if ai_msgs:
+                            # Start with the consolidated user transcript (more accurate)
+                            final_transcription = [consolidated_transcript]
+                            
+                            # Then add all AI responses to maintain the conversation flow
+                            final_transcription.extend(ai_msgs)
+                        else:
+                            # No AI messages, just use the consolidated transcript
+                            final_transcription = [consolidated_transcript]
+                    else:
+                        # No real-time transcripts, just use the consolidated one
+                        final_transcription = [consolidated_transcript]
                 else:
-                    # We have multiple fragments, append them
-                    final_transcription.extend(transcription_service.buffer)
+                    # We have multiple fragments from the transcription service
+                    
+                    if has_real_time_transcripts:
+                        # Try to merge both sources to maintain conversation flow
+                        # Use a simple approach of just combining both sets
+                        final_transcription = transcription_service.buffer + full_transcription
+                    else:
+                        # No real-time transcripts, just use the fragments
+                        final_transcription = transcription_service.buffer
+            else:
+                # No custom transcription, use the real-time one
+                final_transcription = full_transcription
             
             # Remove duplicates while preserving order
             seen = set()
