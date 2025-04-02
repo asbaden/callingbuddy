@@ -14,7 +14,8 @@ from database.supabase_client import (
     create_call_schedule,
     get_active_schedules,
     create_inventory_response,
-    get_inventory_responses_by_call
+    get_inventory_responses_by_call,
+    supabase_available
 )
 
 __all__ = [
@@ -28,5 +29,6 @@ __all__ = [
     'create_call_schedule',
     'get_active_schedules',
     'create_inventory_response',
-    'get_inventory_responses_by_call'
+    'get_inventory_responses_by_call',
+    'supabase_available'
 ] 

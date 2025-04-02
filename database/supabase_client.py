@@ -1,5 +1,6 @@
 import os
 import logging
+import traceback
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
@@ -17,7 +18,9 @@ supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 # Debug output to verify API keys are loaded correctly
 logger.info(f"Supabase URL: {supabase_url}")
 if supabase_key:
-    logger.info(f"Supabase Key: {supabase_key[:10]}...") # Print only first 10 chars for security
+    logger.info(f"Supabase Key length: {len(supabase_key)} chars")
+    logger.info(f"Supabase Key first 10 chars: {supabase_key[:10]}...")
+    logger.info(f"Supabase Key last 10 chars: {supabase_key[-10:]}")
 else:
     logger.error("Supabase key is not set!")
 
@@ -29,15 +32,26 @@ supabase = None
 try:
     # Simple initialization for version 1.0.3
     if supabase_url and supabase_key:
+        logger.info("Attempting to initialize Supabase client...")
         supabase = create_client(supabase_url, supabase_key)
+        
         # Test the connection with a simple query
+        logger.info("Testing Supabase connection with a simple query...")
         test = supabase.table("users").select("*").limit(1).execute()
+        logger.info(f"Supabase test query result: {test}")
+        
         supabase_available = True
-        logger.info("Supabase client initialized successfully")
+        logger.info("Supabase client initialized successfully!")
     else:
-        logger.error("Missing Supabase credentials. Database functionality will be disabled.")
+        missing_vars = []
+        if not supabase_url:
+            missing_vars.append("SUPABASE_URL")
+        if not supabase_key:
+            missing_vars.append("SUPABASE_SERVICE_ROLE_KEY")
+        logger.error(f"Missing Supabase credentials: {', '.join(missing_vars)}. Database functionality will be disabled.")
 except Exception as e:
-    logger.error(f"Error initializing Supabase client: {e}")
+    logger.error(f"Error initializing Supabase client: {str(e)}")
+    logger.error(f"Error details: {traceback.format_exc()}")
     logger.warning("Running without database functionality - calls will not be stored!")
 
 # User operations
@@ -195,4 +209,15 @@ async def create_inventory_response(call_id, question_number, question_text, res
 async def get_inventory_responses_by_call(call_id):
     """Get all inventory responses for a specific call."""
     result = supabase.table("inventory_responses").select("*").eq("call_id", call_id).execute()
-    return result.data if result.data else [] 
+    return result.data if result.data else []
+
+__all__ = [
+    'create_user', 
+    'get_user_by_phone',
+    'create_call',
+    'update_call',
+    'get_call_by_sid',
+    'create_transcription',
+    'get_transcription_by_call_id',
+    'supabase_available'
+] 

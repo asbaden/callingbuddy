@@ -16,6 +16,16 @@ from dotenv import load_dotenv
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Import schema initialization
+try:
+    from database.schema_init import init_schema
+    # Attempt to initialize schema
+    schema_initialized = init_schema()
+    logger.info(f"Schema initialization: {'Success' if schema_initialized else 'Failed'}")
+except Exception as schema_error:
+    logger.error(f"Failed to initialize schema: {schema_error}")
+    schema_initialized = False
+
 # Import Supabase functions - with error handling built in
 try:
     from database.supabase_client import (
@@ -25,11 +35,13 @@ try:
         update_call,
         get_call_by_sid,
         create_transcription,
-        get_transcription_by_call_id
+        get_transcription_by_call_id,
+        supabase_available
     )
-    logger.info("Supabase client imported successfully")
+    logger.info(f"Supabase client imported successfully. Available: {supabase_available}")
 except Exception as e:
     logger.error(f"Failed to import Supabase client: {e}")
+    supabase_available = False
     # Define dummy functions if import fails
     async def create_user(phone_number, **kwargs):
         return {"id": "dummy-user-id", "phone_number": phone_number}
@@ -335,6 +347,28 @@ async def get_call_transcription(call_id: str):
             status_code=500,
             content={"error": f"Error retrieving transcription: {str(e)}"}
         )
+
+@app.get("/health")
+async def health_check():
+    """Endpoint to check the health of the application and its connections."""
+    health = {
+        "status": "healthy",
+        "timestamp": str(asyncio.get_event_loop().time()),
+        "services": {
+            "twilio": "available" if twilio_client else "unavailable",
+            "supabase": "available" if supabase_available else "unavailable"
+        },
+        "config": {
+            "openai_api_key": "configured" if OPENAI_API_KEY else "missing",
+            "twilio_account_sid": "configured" if TWILIO_ACCOUNT_SID else "missing",
+            "twilio_auth_token": "configured" if TWILIO_AUTH_TOKEN else "missing",
+            "twilio_phone_number": "configured" if TWILIO_PHONE_NUMBER else "missing",
+            "supabase_url": "configured" if os.getenv("SUPABASE_URL") else "missing",
+            "supabase_key": "configured" if os.getenv("SUPABASE_SERVICE_ROLE_KEY") else "missing"
+        }
+    }
+    
+    return JSONResponse(content=health)
 
 if __name__ == "__main__":
     import uvicorn
