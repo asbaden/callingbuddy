@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from twilio.twiml.voice_response import VoiceResponse, Connect, Say, Stream
 from twilio.rest import Client
 from dotenv import load_dotenv
+import requests
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -369,6 +370,66 @@ async def health_check():
     }
     
     return JSONResponse(content=health)
+
+@app.get("/debug-supabase")
+async def debug_supabase():
+    """Special endpoint to test Supabase connection directly."""
+    supabase_url = os.getenv("SUPABASE_URL")
+    service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    anon_key = os.getenv("SUPABASE_ANON_KEY")
+    
+    results = {
+        "supabase_url": supabase_url,
+        "service_key_length": len(service_key) if service_key else 0,
+        "anon_key_length": len(anon_key) if anon_key else 0,
+        "direct_api_tests": []
+    }
+    
+    # Try direct REST API call with service key
+    if supabase_url and service_key:
+        try:
+            headers = {
+                "apikey": service_key,
+                "Authorization": f"Bearer {service_key}"
+            }
+            test_url = f"{supabase_url}/rest/v1/users?limit=1"
+            response = requests.get(test_url, headers=headers, timeout=10)
+            results["direct_api_tests"].append({
+                "key_type": "service_role",
+                "url": test_url,
+                "status_code": response.status_code,
+                "response": response.text[:500]  # Truncate long responses
+            })
+        except Exception as e:
+            results["direct_api_tests"].append({
+                "key_type": "service_role",
+                "url": test_url if 'test_url' in locals() else "not set",
+                "error": str(e)
+            })
+    
+    # Try direct REST API call with anon key
+    if supabase_url and anon_key:
+        try:
+            headers = {
+                "apikey": anon_key,
+                "Authorization": f"Bearer {anon_key}"
+            }
+            test_url = f"{supabase_url}/rest/v1/users?limit=1"
+            response = requests.get(test_url, headers=headers, timeout=10)
+            results["direct_api_tests"].append({
+                "key_type": "anon",
+                "url": test_url,
+                "status_code": response.status_code,
+                "response": response.text[:500]  # Truncate long responses
+            })
+        except Exception as e:
+            results["direct_api_tests"].append({
+                "key_type": "anon",
+                "url": test_url if 'test_url' in locals() else "not set",
+                "error": str(e)
+            })
+    
+    return JSONResponse(content=results)
 
 if __name__ == "__main__":
     import uvicorn
