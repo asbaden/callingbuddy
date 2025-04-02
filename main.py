@@ -137,15 +137,27 @@ class TranscriptionService:
             try:
                 # Create WebSocket connection
                 logger.info("Creating new transcription session with OpenAI")
-                self.ws = await websockets.connect(
-                    'wss://api.openai.com/v1/realtime?model=whisper-1',
-                    extra_headers={
-                        "Authorization": f"Bearer {OPENAI_API_KEY}",
-                        "OpenAI-Beta": "realtime=v1"
-                    },
-                    ping_interval=20,
-                    ping_timeout=10
-                )
+                try:
+                    self.ws = await asyncio.wait_for(
+                        websockets.connect(
+                            'wss://api.openai.com/v1/realtime?model=whisper-1',
+                            extra_headers={
+                                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                                "OpenAI-Beta": "realtime=v1"
+                            },
+                            ping_interval=20,
+                            ping_timeout=10
+                        ), 
+                        timeout=10
+                    )
+                except asyncio.TimeoutError:
+                    logger.error("Timeout connecting to OpenAI WebSocket")
+                    self.state = "error"
+                    return False
+                except Exception as conn_error:
+                    logger.error(f"WebSocket connection error: {conn_error}")
+                    self.state = "error"
+                    return False
                 
                 # Configure transcription session
                 session_config = {
@@ -159,8 +171,15 @@ class TranscriptionService:
                     }
                 }
                 
-                await self.ws.send(json.dumps(session_config))
-                logger.info("Transcription session configured")
+                try:
+                    await asyncio.wait_for(self.ws.send(json.dumps(session_config)), timeout=5)
+                    logger.info("Transcription session configured")
+                except asyncio.TimeoutError:
+                    logger.error("Timeout sending configuration to OpenAI")
+                    self.state = "error"
+                    await self.ws.close()
+                    self.ws = None
+                    return False
                 
                 # Wait for confirmation
                 try:
@@ -176,17 +195,31 @@ class TranscriptionService:
                         self.sending_task = asyncio.create_task(self._process_audio_queue())
                         logger.info("Started audio queue processing task")
                     
+                    # Start heartbeat
+                    if not hasattr(self, 'heartbeat_task') or self.heartbeat_task.done():
+                        self.heartbeat_task = asyncio.create_task(self._heartbeat())
+                        logger.info("Started WebSocket heartbeat task")
+                    
                     self.state = "ready"
+                    self.error_count = 0  # Reset error count on successful connection
                     return True
                 except asyncio.TimeoutError:
                     logger.warning("No immediate response from transcription session")
                     self.state = "error"
+                    await self.ws.close()
+                    self.ws = None
                     return False
             except Exception as e:
                 logger.error(f"Failed to create transcription session: {str(e)}")
                 import traceback
                 logger.error(traceback.format_exc())
                 self.state = "error"
+                if self.ws:
+                    try:
+                        await self.ws.close()
+                    except:
+                        pass
+                    self.ws = None
                 return False
     
     async def stop(self):
@@ -205,6 +238,10 @@ class TranscriptionService:
             if self.sending_task and not self.sending_task.done():
                 self.sending_task.cancel()
                 logger.info("Cancelled sending task")
+            
+            if hasattr(self, 'heartbeat_task') and not self.heartbeat_task.done():
+                self.heartbeat_task.cancel()
+                logger.info("Cancelled heartbeat task")
             
             # Close WebSocket
             if self.ws:
@@ -253,7 +290,7 @@ class TranscriptionService:
                 audio_data = await self.audio_queue.get()
                 
                 if self.state != "ready" or not self.ws or not self.ws.open:
-                    logger.warning(f"Cannot send audio in state: {self.state}")
+                    logger.warning(f"Cannot send audio in state: {self.state}, WebSocket open: {self.ws and self.ws.open}")
                     self.audio_queue.task_done()
                     continue
                 
@@ -264,6 +301,10 @@ class TranscriptionService:
                         "data": audio_data
                     }
                     await self.ws.send(json.dumps(audio_message))
+                    self.audio_queue.task_done()
+                except websockets.exceptions.ConnectionClosed as conn_error:
+                    logger.error(f"WebSocket connection closed while sending audio: {conn_error}")
+                    self.state = "error"
                     self.audio_queue.task_done()
                 except Exception as e:
                     logger.error(f"Error sending audio: {str(e)}")
@@ -286,29 +327,35 @@ class TranscriptionService:
                 self.state = "error"
                 return
                 
-            async for message in self.ws:
-                try:
-                    response = json.loads(message)
-                    logger.info(f"Transcription event: {response['type']}")
-                    
-                    # Handle different types of transcription responses
-                    if response['type'] == 'transcription.parts':
-                        text = response.get('text', '')
-                        if text:
-                            logger.info(f"Partial transcription: {text}")
-                            self.buffer.append(f"User: {text}")
-                    
-                    elif response['type'] == 'transcription.completed':
-                        final_text = response.get('text', '')
-                        if final_text:
-                            logger.info(f"Completed transcription: {final_text}")
-                            # Replace the last partial with the complete transcription
-                            if self.buffer and self.buffer[-1].startswith("User: "):
-                                self.buffer[-1] = f"User: {final_text}"
-                            else:
-                                self.buffer.append(f"User: {final_text}")
-                except Exception as parse_error:
-                    logger.error(f"Error parsing transcription message: {str(parse_error)}")
+            try:
+                async for message in self.ws:
+                    try:
+                        response = json.loads(message)
+                        logger.info(f"Transcription event: {response['type']}")
+                        
+                        # Handle different types of transcription responses
+                        if response['type'] == 'transcription.parts':
+                            text = response.get('text', '')
+                            if text:
+                                logger.info(f"Partial transcription: {text}")
+                                self.buffer.append(f"User: {text}")
+                        
+                        elif response['type'] == 'transcription.completed':
+                            final_text = response.get('text', '')
+                            if final_text:
+                                logger.info(f"Completed transcription: {final_text}")
+                                # Replace the last partial with the complete transcription
+                                if self.buffer and self.buffer[-1].startswith("User: "):
+                                    self.buffer[-1] = f"User: {final_text}"
+                                else:
+                                    self.buffer.append(f"User: {final_text}")
+                    except json.JSONDecodeError as json_error:
+                        logger.error(f"Error parsing JSON from transcription message: {json_error}")
+                    except Exception as parse_error:
+                        logger.error(f"Error parsing transcription message: {str(parse_error)}")
+            except websockets.exceptions.ConnectionClosed as conn_error:
+                logger.error(f"WebSocket connection closed while reading results: {conn_error}")
+                self.state = "error"
         except asyncio.CancelledError:
             logger.info("Transcription processing task was cancelled")
             raise
@@ -326,6 +373,34 @@ class TranscriptionService:
         """Clear the transcription buffer."""
         self.buffer = []
         return True
+
+    async def _heartbeat(self):
+        """Periodically check WebSocket connection health."""
+        try:
+            while True:
+                await asyncio.sleep(30)  # Check every 30 seconds
+                
+                if not self.ws or not self.ws.open:
+                    logger.warning("WebSocket connection lost in heartbeat check")
+                    self.state = "error"
+                    break
+                    
+                # Optional: send a ping if the WebSocket protocol allows it
+                if self.state == "ready":
+                    try:
+                        pong_waiter = await self.ws.ping()
+                        await asyncio.wait_for(pong_waiter, timeout=5)
+                        logger.debug("WebSocket heartbeat successful")
+                    except Exception as ping_error:
+                        logger.warning(f"WebSocket heartbeat failed: {ping_error}")
+                        self.state = "error"
+                        break
+        except asyncio.CancelledError:
+            logger.info("Heartbeat task was cancelled")
+            raise
+        except Exception as e:
+            logger.error(f"Error in heartbeat task: {str(e)}")
+            self.state = "error"
 
 # Initialize the transcription service
 transcription_service = TranscriptionService()
