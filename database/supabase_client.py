@@ -21,7 +21,8 @@ if not supabase_key:
     raise ValueError("Missing SUPABASE_SERVICE_ROLE_KEY in environment variables")
 
 try:
-    supabase: Client = create_client(supabase_url, supabase_key)
+    # Simple initialization for version 1.0.3
+    supabase = create_client(supabase_url, supabase_key)
 except Exception as e:
     print(f"Error initializing Supabase client: {e}")
     raise
