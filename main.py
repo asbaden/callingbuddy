@@ -4,6 +4,8 @@ import base64
 import logging
 import asyncio
 import websockets
+import aiohttp
+import tempfile
 from fastapi import FastAPI, WebSocket, Request, Body
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.websockets import WebSocketDisconnect
@@ -116,7 +118,6 @@ class TranscriptionService:
     """A service to manage a transcription session with proper state handling."""
     
     def __init__(self):
-        self.ws = None
         self.buffer = []
         self.audio_queue = asyncio.Queue()
         self.processing_task = None
@@ -125,6 +126,9 @@ class TranscriptionService:
         self.state = "closed"       # States: closed, initializing, ready, error
         self.error_count = 0
         self.max_errors = 3
+        self.accumulated_audio = b''  # To accumulate audio data for batch processing
+        self.last_processing_time = 0
+        self.processing_interval = 3  # Process audio every 3 seconds
     
     async def start(self):
         """Start the transcription service if it's not already running."""
@@ -135,97 +139,26 @@ class TranscriptionService:
                 
             self.state = "initializing"
             try:
-                # Create WebSocket connection
-                logger.info("Creating new transcription session with OpenAI")
-                try:
-                    self.ws = await asyncio.wait_for(
-                        websockets.connect(
-                            'wss://api.openai.com/v1/realtime/transcription?model=whisper-1',
-                            extra_headers={
-                                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                                "OpenAI-Beta": "realtime=v1"
-                            },
-                            ping_interval=20,
-                            ping_timeout=10
-                        ), 
-                        timeout=10
-                    )
-                except asyncio.TimeoutError:
-                    logger.error("Timeout connecting to OpenAI WebSocket")
-                    self.state = "error"
-                    return False
-                except Exception as conn_error:
-                    logger.error(f"WebSocket connection error: {conn_error}")
+                # Verify API key is set
+                if not OPENAI_API_KEY:
+                    logger.error("OpenAI API key is not configured")
                     self.state = "error"
                     return False
                 
-                # Configure transcription session
-                session_config = {
-                    "type": "transcription_session.update",
-                    "session": {
-                        "input_audio_format": "g711_ulaw",
-                        "input_audio_transcription": {
-                            "model": "whisper-1",
-                            "language": "en"
-                        },
-                        "turn_detection": {
-                            "type": "server_vad",
-                            "threshold": 0.5,
-                            "prefix_padding_ms": 300,
-                            "silence_duration_ms": 200
-                        }
-                    }
-                }
+                # Start the processing tasks if not already running
+                if not self.processing_task or self.processing_task.done():
+                    self.processing_task = asyncio.create_task(self._process_audio_queue())
+                    logger.info("Started audio queue processing task")
                 
-                try:
-                    await asyncio.wait_for(self.ws.send(json.dumps(session_config)), timeout=5)
-                    logger.info("Transcription session configured")
-                except asyncio.TimeoutError:
-                    logger.error("Timeout sending configuration to OpenAI")
-                    self.state = "error"
-                    await self.ws.close()
-                    self.ws = None
-                    return False
+                self.state = "ready"
+                self.error_count = 0  # Reset error count on successful connection
+                return True
                 
-                # Wait for confirmation
-                try:
-                    response = await asyncio.wait_for(self.ws.recv(), timeout=5)
-                    logger.info(f"Transcription session response: {response}")
-                    
-                    # Start the processing tasks if not already running
-                    if not self.processing_task or self.processing_task.done():
-                        self.processing_task = asyncio.create_task(self._process_results())
-                        logger.info("Started transcription results processing task")
-                        
-                    if not self.sending_task or self.sending_task.done():
-                        self.sending_task = asyncio.create_task(self._process_audio_queue())
-                        logger.info("Started audio queue processing task")
-                    
-                    # Start heartbeat
-                    if not hasattr(self, 'heartbeat_task') or self.heartbeat_task.done():
-                        self.heartbeat_task = asyncio.create_task(self._heartbeat())
-                        logger.info("Started WebSocket heartbeat task")
-                    
-                    self.state = "ready"
-                    self.error_count = 0  # Reset error count on successful connection
-                    return True
-                except asyncio.TimeoutError:
-                    logger.warning("No immediate response from transcription session")
-                    self.state = "error"
-                    await self.ws.close()
-                    self.ws = None
-                    return False
             except Exception as e:
-                logger.error(f"Failed to create transcription session: {str(e)}")
+                logger.error(f"Failed to start transcription service: {str(e)}")
                 import traceback
                 logger.error(traceback.format_exc())
                 self.state = "error"
-                if self.ws:
-                    try:
-                        await self.ws.close()
-                    except:
-                        pass
-                    self.ws = None
                 return False
     
     async def stop(self):
@@ -245,20 +178,9 @@ class TranscriptionService:
                 self.sending_task.cancel()
                 logger.info("Cancelled sending task")
             
-            if hasattr(self, 'heartbeat_task') and not self.heartbeat_task.done():
-                self.heartbeat_task.cancel()
-                logger.info("Cancelled heartbeat task")
-            
-            # Close WebSocket
-            if self.ws:
-                try:
-                    await self.ws.close()
-                    logger.info("Closed transcription WebSocket")
-                except Exception as e:
-                    logger.error(f"Error closing WebSocket: {str(e)}")
-            
             self.state = "closed"
             self.error_count = 0
+            self.accumulated_audio = b''
     
     async def send_audio(self, audio_data):
         """Queue audio data to be sent to the transcription service."""
@@ -285,37 +207,41 @@ class TranscriptionService:
                 return False
         
         # Add to the queue - non-blocking
-        await self.audio_queue.put(audio_data)
-        return True
+        try:
+            # Convert base64 audio to binary
+            binary_audio = base64.b64decode(audio_data)
+            await self.audio_queue.put(binary_audio)
+            return True
+        except Exception as e:
+            logger.error(f"Error processing audio data: {str(e)}")
+            return False
     
     async def _process_audio_queue(self):
-        """Process the audio queue and send to the transcription service."""
+        """Process the audio queue and send batches to the transcription service."""
         try:
             while True:
+                current_time = asyncio.get_event_loop().time()
+                
                 # Wait for audio data
-                audio_data = await self.audio_queue.get()
+                if not self.audio_queue.empty():
+                    audio_data = await self.audio_queue.get()
+                    self.accumulated_audio += audio_data
+                    self.audio_queue.task_done()
                 
-                if self.state != "ready" or not self.ws or not self.ws.open:
-                    logger.warning(f"Cannot send audio in state: {self.state}, WebSocket open: {self.ws and self.ws.open}")
-                    self.audio_queue.task_done()
-                    continue
+                # Process accumulated audio if enough time has passed
+                if (current_time - self.last_processing_time >= self.processing_interval 
+                    and len(self.accumulated_audio) > 0):
+                    
+                    # Send accumulated audio for transcription
+                    await self._transcribe_audio(self.accumulated_audio)
+                    
+                    # Reset accumulated audio and update timer
+                    self.accumulated_audio = b''
+                    self.last_processing_time = current_time
                 
-                try:
-                    # Send the audio data
-                    audio_message = {
-                        "type": "audio",
-                        "data": audio_data
-                    }
-                    await self.ws.send(json.dumps(audio_message))
-                    self.audio_queue.task_done()
-                except websockets.exceptions.ConnectionClosed as conn_error:
-                    logger.error(f"WebSocket connection closed while sending audio: {conn_error}")
-                    self.state = "error"
-                    self.audio_queue.task_done()
-                except Exception as e:
-                    logger.error(f"Error sending audio: {str(e)}")
-                    self.state = "error"
-                    self.audio_queue.task_done()
+                # Small delay to avoid busy waiting
+                await asyncio.sleep(0.1)
+                
         except asyncio.CancelledError:
             logger.info("Audio queue processing task was cancelled")
             raise
@@ -325,67 +251,66 @@ class TranscriptionService:
             logger.error(traceback.format_exc())
             self.state = "error"
     
-    async def _process_results(self):
-        """Process transcription results from the WebSocket."""
+    async def _transcribe_audio(self, audio_data):
+        """Send audio data to OpenAI Whisper API for transcription."""
+        if not audio_data or len(audio_data) < 100:  # Skip very small audio chunks
+            return
+            
         try:
-            if not self.ws or not self.ws.open:
-                logger.error("WebSocket not available for processing results")
-                self.state = "error"
-                return
-                
+            # Save audio to a temporary file
+            with tempfile.NamedTemporaryFile(suffix=".ulaw", delete=False) as temp_file:
+                temp_filename = temp_file.name
+                temp_file.write(audio_data)
+            
+            logger.info(f"Sending {len(audio_data)} bytes of audio for transcription")
+            
+            # Define headers and data for the request
+            headers = {
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+            }
+            
+            # Prepare form data with the audio file
+            data = aiohttp.FormData()
+            data.add_field('file', open(temp_filename, 'rb'), filename='audio.ulaw')
+            data.add_field('model', 'whisper-1')
+            data.add_field('language', 'en')
+            data.add_field('response_format', 'json')
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    'https://api.openai.com/v1/audio/transcriptions',
+                    headers=headers,
+                    data=data
+                ) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        transcription = result.get('text', '')
+                        
+                        if transcription:
+                            logger.info(f"Transcription result: {transcription}")
+                            
+                            # Add to buffer
+                            self.buffer.append(f"User: {transcription}")
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"Transcription API error: {response.status} - {error_text}")
+                        
+                        # Check if this is an authentication error
+                        if response.status == 401:
+                            logger.error("Authentication error: Invalid API key or insufficient permissions")
+                        elif response.status == 400:
+                            logger.error("Bad request: The API couldn't process the audio format")
+                        
+                        self.state = "error"
+            
+            # Clean up the temporary file
             try:
-                async for message in self.ws:
-                    try:
-                        response = json.loads(message)
-                        logger.info(f"Transcription event: {response['type']}")
-                        
-                        # Handle different types of transcription responses
-                        if response['type'] == 'transcription.parts':
-                            text = response.get('text', '')
-                            if text:
-                                logger.info(f"Partial transcription: {text}")
-                                self.buffer.append(f"User: {text}")
-                        
-                        elif response['type'] == 'transcription.completed':
-                            final_text = response.get('text', '')
-                            if final_text:
-                                logger.info(f"Completed transcription: {final_text}")
-                                # Replace the last partial with the complete transcription
-                                if self.buffer and self.buffer[-1].startswith("User: "):
-                                    self.buffer[-1] = f"User: {final_text}"
-                                else:
-                                    self.buffer.append(f"User: {final_text}")
-                        
-                        # Handle conversation.item.input_audio_transcription events (new format)
-                        elif response['type'] == 'conversation.item.input_audio_transcription.delta':
-                            delta = response.get('delta', '')
-                            if delta:
-                                logger.info(f"Transcription delta: {delta}")
-                                if self.buffer and self.buffer[-1].startswith("User: "):
-                                    self.buffer[-1] = f"User: {self.buffer[-1][6:] + delta}"
-                                else:
-                                    self.buffer.append(f"User: {delta}")
-                        
-                        elif response['type'] == 'conversation.item.input_audio_transcription.completed':
-                            transcript = response.get('transcript', '')
-                            if transcript:
-                                logger.info(f"Completed transcription: {transcript}")
-                                if self.buffer and self.buffer[-1].startswith("User: "):
-                                    self.buffer[-1] = f"User: {transcript}"
-                                else:
-                                    self.buffer.append(f"User: {transcript}")
-                    except json.JSONDecodeError as json_error:
-                        logger.error(f"Error parsing JSON from transcription message: {json_error}")
-                    except Exception as parse_error:
-                        logger.error(f"Error parsing transcription message: {str(parse_error)}")
-            except websockets.exceptions.ConnectionClosed as conn_error:
-                logger.error(f"WebSocket connection closed while reading results: {conn_error}")
-                self.state = "error"
-        except asyncio.CancelledError:
-            logger.info("Transcription processing task was cancelled")
-            raise
+                os.unlink(temp_filename)
+            except Exception as e:
+                logger.error(f"Error removing temporary file: {str(e)}")
+                
         except Exception as e:
-            logger.error(f"Error processing transcription results: {str(e)}")
+            logger.error(f"Error in transcription: {str(e)}")
             import traceback
             logger.error(traceback.format_exc())
             self.state = "error"
@@ -398,34 +323,6 @@ class TranscriptionService:
         """Clear the transcription buffer."""
         self.buffer = []
         return True
-
-    async def _heartbeat(self):
-        """Periodically check WebSocket connection health."""
-        try:
-            while True:
-                await asyncio.sleep(30)  # Check every 30 seconds
-                
-                if not self.ws or not self.ws.open:
-                    logger.warning("WebSocket connection lost in heartbeat check")
-                    self.state = "error"
-                    break
-                    
-                # Optional: send a ping if the WebSocket protocol allows it
-                if self.state == "ready":
-                    try:
-                        pong_waiter = await self.ws.ping()
-                        await asyncio.wait_for(pong_waiter, timeout=5)
-                        logger.debug("WebSocket heartbeat successful")
-                    except Exception as ping_error:
-                        logger.warning(f"WebSocket heartbeat failed: {ping_error}")
-                        self.state = "error"
-                        break
-        except asyncio.CancelledError:
-            logger.info("Heartbeat task was cancelled")
-            raise
-        except Exception as e:
-            logger.error(f"Error in heartbeat task: {str(e)}")
-            self.state = "error"
 
 # Initialize the transcription service
 transcription_service = TranscriptionService()
