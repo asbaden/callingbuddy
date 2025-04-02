@@ -14,6 +14,30 @@ export default function CallScreen() {
   const [phoneNumber, setPhoneNumber] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [serverStatus, setServerStatus] = useState<'unknown' | 'checking' | 'ready' | 'error'>('unknown');
+
+  // Create axios instance with longer timeout
+  const axiosInstance = axios.create({
+    timeout: 30000, // 30 seconds
+  });
+
+  // Check server status
+  const checkServerStatus = async () => {
+    setServerStatus('checking');
+    setErrorMessage(null);
+    
+    try {
+      const response = await axiosInstance.get(BACKEND_URL);
+      console.log('Server status check response:', response.data);
+      setServerStatus('ready');
+      return true;
+    } catch (error) {
+      console.error('Error checking server status:', error);
+      setServerStatus('error');
+      setErrorMessage('Server is not responding. Please try again in a minute.');
+      return false;
+    }
+  };
 
   const initiateCall = async () => {
     // Simple validation
@@ -25,11 +49,22 @@ export default function CallScreen() {
     setIsLoading(true);
     setErrorMessage(null);
 
+    // First check if server is ready
+    const isReady = await checkServerStatus();
+    if (!isReady) {
+      setIsLoading(false);
+      Alert.alert(
+        'Server Not Ready',
+        'Please wake up the server first by clicking the "Wake Up Server" button and wait about 30 seconds.'
+      );
+      return;
+    }
+
     try {
       console.log(`Making request to: ${BACKEND_URL}/call-user`);
       
       // Request the Twilio service to call your number
-      const response = await axios.post(`${BACKEND_URL}/call-user`, {
+      const response = await axiosInstance.post(`${BACKEND_URL}/call-user`, {
         to: phoneNumber,
       });
 
@@ -47,10 +82,14 @@ export default function CallScreen() {
       let errorMsg = 'There was a problem initiating the call.';
       
       if (axios.isAxiosError(error)) {
-        errorMsg += ` Status: ${error.response?.status || 'unknown'}`;
-        errorMsg += ` Message: ${error.message}`;
-        if (error.response?.data) {
-          errorMsg += ` Details: ${JSON.stringify(error.response.data)}`;
+        if (error.code === 'ECONNABORTED') {
+          errorMsg = 'Request timed out. The server might be starting up. Try again in a minute.';
+        } else {
+          errorMsg += ` Status: ${error.response?.status || 'unknown'}`;
+          errorMsg += ` Message: ${error.message}`;
+          if (error.response?.data) {
+            errorMsg += ` Details: ${JSON.stringify(error.response.data)}`;
+          }
         }
       }
       
@@ -89,6 +128,31 @@ export default function CallScreen() {
     <View style={styles.container}>
       <Text style={styles.title}>Call AI Assistant</Text>
       
+      <View style={styles.serverStatusContainer}>
+        <Text style={styles.serverStatusText}>
+          Server Status: {
+            serverStatus === 'unknown' ? 'Unknown' :
+            serverStatus === 'checking' ? 'Checking...' :
+            serverStatus === 'ready' ? 'Ready' : 'Not Responding'
+          }
+        </Text>
+        <TouchableOpacity
+          style={[
+            styles.serverStatusButton,
+            serverStatus === 'checking' && styles.serverStatusButtonDisabled
+          ]}
+          onPress={checkServerStatus}
+          disabled={serverStatus === 'checking'}
+        >
+          <Text style={styles.serverStatusButtonText}>
+            {serverStatus === 'checking' ? 'Checking...' : 'Wake Up Server'}
+          </Text>
+        </TouchableOpacity>
+        <Text style={styles.serverTip}>
+          Tip: Free servers may take 30-60 seconds to wake up. Click the button above and wait before making a call.
+        </Text>
+      </View>
+      
       <View style={styles.inputContainer}>
         <Text style={styles.label}>Your Phone Number</Text>
         <TextInput
@@ -107,9 +171,12 @@ export default function CallScreen() {
       </Text>
       
       <TouchableOpacity 
-        style={styles.callButton}
+        style={[
+          styles.callButton,
+          (isLoading || serverStatus !== 'ready') && styles.callButtonDisabled
+        ]}
         onPress={initiateCall}
-        disabled={isLoading}
+        disabled={isLoading || serverStatus !== 'ready'}
       >
         {isLoading ? (
           <ActivityIndicator color="#fff" />
@@ -148,9 +215,42 @@ const styles = StyleSheet.create({
   title: {
     fontSize: 24,
     fontWeight: 'bold',
-    marginBottom: 30,
+    marginBottom: 20,
     textAlign: 'center',
     color: '#2c3e50',
+  },
+  serverStatusContainer: {
+    backgroundColor: '#fff',
+    padding: 15,
+    borderRadius: 10,
+    marginBottom: 20,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#e0e0e0',
+  },
+  serverStatusText: {
+    fontSize: 16,
+    marginBottom: 10,
+    color: '#555',
+  },
+  serverStatusButton: {
+    backgroundColor: '#4CAF50',
+    paddingVertical: 8,
+    paddingHorizontal: 15,
+    borderRadius: 5,
+  },
+  serverStatusButtonDisabled: {
+    backgroundColor: '#a0a0a0',
+  },
+  serverStatusButtonText: {
+    color: 'white',
+    fontWeight: '600',
+  },
+  serverTip: {
+    fontSize: 12,
+    color: '#777',
+    marginTop: 10,
+    textAlign: 'center',
   },
   inputContainer: {
     marginBottom: 25,
@@ -186,6 +286,9 @@ const styles = StyleSheet.create({
     borderRadius: 10,
     alignItems: 'center',
     marginBottom: 20,
+  },
+  callButtonDisabled: {
+    backgroundColor: '#a0a0a0',
   },
   callButtonText: {
     color: 'white',
