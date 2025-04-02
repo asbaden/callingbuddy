@@ -431,6 +431,37 @@ async def debug_supabase():
     
     return JSONResponse(content=results)
 
+@app.get("/debug-key-format")
+async def debug_key_format():
+    """Endpoint to check the format of API keys without revealing them."""
+    service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+    anon_key = os.getenv("SUPABASE_ANON_KEY", "")
+    
+    results = {
+        "service_key": {
+            "length": len(service_key),
+            "first_10_chars": service_key[:10] if service_key else "",
+            "last_10_chars": service_key[-10:] if len(service_key) >= 10 else "",
+            "starts_with_eyJ": service_key.startswith("eyJ") if service_key else False,
+            "contains_newlines": "\n" in service_key,
+            "contains_spaces": " " in service_key,
+            "contains_quotes": "\"" in service_key or "'" in service_key,
+            "common_format": bool(service_key.startswith("eyJ") and "." in service_key and len(service_key) > 100) if service_key else False
+        },
+        "anon_key": {
+            "length": len(anon_key),
+            "first_10_chars": anon_key[:10] if anon_key else "",
+            "last_10_chars": anon_key[-10:] if len(anon_key) >= 10 else "",
+            "starts_with_eyJ": anon_key.startswith("eyJ") if anon_key else False,
+            "contains_newlines": "\n" in anon_key,
+            "contains_spaces": " " in anon_key,
+            "contains_quotes": "\"" in anon_key or "'" in anon_key,
+            "common_format": bool(anon_key.startswith("eyJ") and "." in anon_key and len(anon_key) > 100) if anon_key else False
+        }
+    }
+    
+    return JSONResponse(content=results)
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT) 
