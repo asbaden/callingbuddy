@@ -55,6 +55,8 @@ document.addEventListener('DOMContentLoaded', function() {
         resultDiv.classList.remove('hidden');
     }
     
+    let websocket = null; // Global variable to hold the WebSocket instance
+
     // Initiate call
     async function initiateCall() {
         // Get and validate phone number
@@ -99,45 +101,113 @@ document.addEventListener('DOMContentLoaded', function() {
             const data = await response.text();
             log(`Response: ${data}`);
             
-            // Try to parse JSON response
             let jsonData;
             try {
                 jsonData = JSON.parse(data);
                 log(`Parsed JSON: ${JSON.stringify(jsonData)}`);
             } catch (e) {
-                log(`Not JSON data: ${data}`);
+                log(`Could not parse JSON response: ${data}`);
+                jsonData = null;
             }
             
-            if (response.ok) {
-                // Success
-                if (jsonData && jsonData.call_sid) {
-                    showResult(`Call initiated successfully! You will receive a call at ${formattedNumber} shortly.`);
-                    log(`Call SID: ${jsonData.call_sid}`);
-                } else {
-                    showResult(`Call initiated successfully!`);
-                }
+            if (response.ok && jsonData && jsonData.call_record_id) {
+                // --- SUCCESS: Start WebSocket Session --- 
+                const callRecordId = jsonData.call_record_id;
+                showResult(`Virtual session initiated (ID: ${callRecordId}). Connecting...`);
+                log(`Call Record ID: ${callRecordId}`);
+                phoneNumberInput.value = ''; // Clear input
                 
-                // Clear input
-                phoneNumberInput.value = '';
+                // Start the WebSocket connection
+                startWebSocketSession(callRecordId);
+                
+                // Keep button disabled until WebSocket closes or call ends
+                // We will re-enable it in the WebSocket close handler later
+                buttonText.textContent = 'Connected'; 
+                // Don't re-enable callButton here
+
             } else {
-                // Error
+                // --- ERROR --- 
                 const errorMessage = (jsonData && jsonData.error) 
                     ? jsonData.error 
                     : `Error: ${response.status} ${response.statusText}`;
                     
                 showResult(errorMessage, false);
                 log(`Error: ${errorMessage}`);
+                // Reset button state on error
+                callButton.disabled = false;
+                spinner.classList.add('hidden');
+                buttonText.textContent = 'Get AI Call';
             }
         } catch (error) {
             // Network error
             log(`Fetch error: ${error.message}`);
             showResult(`Network error: ${error.message}. Please try again later.`, false);
-        } finally {
-            // Reset button state
+            // Reset button state on error
             callButton.disabled = false;
             spinner.classList.add('hidden');
             buttonText.textContent = 'Get AI Call';
+        } 
+        // Remove finally block resetting button - handled in success/error/close cases
+    }
+    
+    // --- NEW FUNCTION: WebSocket Handling --- 
+    function startWebSocketSession(callRecordId) {
+        const wsUrl = `${BACKEND_URL}/media-stream?call_record_id=${callRecordId}`;
+        log(`Connecting WebSocket to: ${wsUrl}`);
+        
+        if (websocket && websocket.readyState === WebSocket.OPEN) {
+            log('WebSocket already open. Closing previous connection.');
+            websocket.close();
         }
+
+        websocket = new WebSocket(wsUrl);
+
+        websocket.onopen = (event) => {
+            log('WebSocket connection established.');
+            showResult('Connected to AI. Session active.');
+            // TODO: Start microphone capture here
+        };
+
+        websocket.onmessage = (event) => {
+            log('Received message via WebSocket:');
+            try {
+                const message = JSON.parse(event.data);
+                log(JSON.stringify(message, null, 2)); // Pretty print message
+                
+                if (message.event === 'audio') {
+                    // TODO: Handle incoming audio playback
+                    log('Received AI audio chunk.');
+                } else if (message.event === 'transcript') {
+                    // TODO: Handle incoming transcript display
+                    log(`Transcript (${message.sender}): ${message.text}`);
+                } else {
+                    log(`Unknown message event type: ${message.event}`);
+                }
+            } catch (e) {
+                log(`Error parsing WebSocket message: ${e}`);
+                log(`Raw message data: ${event.data}`);
+            }
+        };
+
+        websocket.onerror = (event) => {
+            log(`WebSocket Error: ${JSON.stringify(event)}`);
+            showResult('WebSocket connection error.', false);
+            // Reset button state on error
+            callButton.disabled = false;
+            spinner.classList.add('hidden');
+            buttonText.textContent = 'Get AI Call';
+        };
+
+        websocket.onclose = (event) => {
+            log(`WebSocket connection closed. Code: ${event.code}, Reason: ${event.reason}`);
+            showResult(`Session ended (Code: ${event.code})`, !event.wasClean);
+            websocket = null; // Clear the global variable
+            // Reset button state on close
+            callButton.disabled = false;
+            spinner.classList.add('hidden');
+            buttonText.textContent = 'Get AI Call';
+            // TODO: Stop microphone capture here
+        };
     }
     
     // Initial log
