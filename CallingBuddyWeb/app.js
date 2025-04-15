@@ -9,6 +9,8 @@ document.addEventListener('DOMContentLoaded', function() {
     const spinner = callButton.querySelector('.spinner');
     const resultDiv = document.getElementById('result');
     const logsDiv = document.getElementById('logs');
+    const transcriptArea = document.getElementById('transcriptArea');
+    const transcriptOutput = document.getElementById('transcriptOutput');
     
     // Initialize
     phoneNumberInput.focus();
@@ -37,17 +39,6 @@ document.addEventListener('DOMContentLoaded', function() {
         console.log(`[${timestamp}] ${message}`);
     }
     
-    // Format phone number
-    function formatPhoneNumber(phoneNumber) {
-        // If number doesn't start with +, add +1 (for US)
-        if (!phoneNumber.startsWith('+')) {
-            return `+1${phoneNumber.replace(/\D/g, '')}`;
-        }
-        
-        // Otherwise just remove non-digits except for the +
-        return `+${phoneNumber.substring(1).replace(/\D/g, '')}`;
-    }
-    
     // Show result
     function showResult(message, isSuccess = true) {
         resultDiv.textContent = message;
@@ -61,29 +52,19 @@ document.addEventListener('DOMContentLoaded', function() {
 
     // Initiate call
     async function initiateCall() {
-        // Get and validate phone number
-        const phoneNumber = phoneNumberInput.value.trim();
-        
-        if (!phoneNumber || phoneNumber.length < 10) {
-            showResult('Please enter a valid phone number with country code', false);
-            phoneNumberInput.focus();
-            return;
-        }
-        
-        // Format phone number
-        const formattedNumber = formatPhoneNumber(phoneNumber);
-        
         // Show loading state
         callButton.disabled = true;
         spinner.classList.remove('hidden');
-        buttonText.textContent = 'Processing...';
+        buttonText.textContent = 'Initiating...';
         resultDiv.classList.add('hidden');
+        transcriptArea.classList.remove('hidden');
+        transcriptOutput.innerHTML = '';
         
-        // Get call type from the selection (assuming dropdown/radio with id="callTypeSelect")
+        // Get call type from the selection
         const callTypeElement = document.getElementById('callTypeSelect');
-        const callType = callTypeElement ? callTypeElement.value : 'morning'; // Default to morning if not found
+        const callType = callTypeElement ? callTypeElement.value : 'morning';
 
-        log(`Initiating ${callType} call to: ${formattedNumber}`);
+        log(`Initiating ${callType} virtual session...`);
         log(`Sending request to: ${BACKEND_URL}/call-user`);
         
         try {
@@ -93,13 +74,11 @@ document.addEventListener('DOMContentLoaded', function() {
                     'Content-Type': 'application/json',
                 },
                 body: JSON.stringify({ 
-                    phone_number: formattedNumber, 
                     call_type: callType 
                 })
             });
             
             log(`Received status: ${response.status}`);
-            
             const data = await response.text();
             log(`Response: ${data}`);
             
@@ -113,22 +92,18 @@ document.addEventListener('DOMContentLoaded', function() {
             }
             
             if (response.ok && jsonData && jsonData.call_record_id) {
-                // --- SUCCESS: Start WebSocket Session --- 
+                // SUCCESS: Start WebSocket Session
                 const callRecordId = jsonData.call_record_id;
                 showResult(`Virtual session initiated (ID: ${callRecordId}). Connecting...`);
                 log(`Call Record ID: ${callRecordId}`);
-                phoneNumberInput.value = ''; // Clear input
                 
-                // Start the WebSocket connection
                 startWebSocketSession(callRecordId);
                 
-                // Keep button disabled until WebSocket closes or call ends
-                // We will re-enable it in the WebSocket close handler later
-                buttonText.textContent = 'Connected'; 
-                // Don't re-enable callButton here
+                // Keep button disabled, update text
+                buttonText.textContent = 'Session Active';
 
             } else {
-                // --- ERROR --- 
+                // ERROR
                 const errorMessage = (jsonData && jsonData.error) 
                     ? jsonData.error 
                     : `Error: ${response.status} ${response.statusText}`;
@@ -138,7 +113,7 @@ document.addEventListener('DOMContentLoaded', function() {
                 // Reset button state on error
                 callButton.disabled = false;
                 spinner.classList.add('hidden');
-                buttonText.textContent = 'Get AI Call';
+                buttonText.textContent = 'Start AI Session';
             }
         } catch (error) {
             // Network error
@@ -147,9 +122,8 @@ document.addEventListener('DOMContentLoaded', function() {
             // Reset button state on error
             callButton.disabled = false;
             spinner.classList.add('hidden');
-            buttonText.textContent = 'Get AI Call';
+            buttonText.textContent = 'Start AI Session';
         } 
-        // Remove finally block resetting button - handled in success/error/close cases
     }
     
     // --- WebSocket Handling --- 
@@ -233,7 +207,7 @@ document.addEventListener('DOMContentLoaded', function() {
             // Reset button state on error
             callButton.disabled = false;
             spinner.classList.add('hidden');
-            buttonText.textContent = 'Get AI Call';
+            buttonText.textContent = 'Start AI Session';
         };
 
         websocket.onclose = (event) => {
@@ -256,7 +230,7 @@ document.addEventListener('DOMContentLoaded', function() {
             // Reset button state on close
             callButton.disabled = false;
             spinner.classList.add('hidden');
-            buttonText.textContent = 'Get AI Call';
+            buttonText.textContent = 'Start AI Session';
         };
     }
     

@@ -128,8 +128,7 @@ call_mapping = {
 
 # --- Pydantic Models ---
 class CallUserRequest(BaseModel):
-    phone_number: str
-    call_type: str = Field(..., pattern="^(morning|evening)$") # Enforce morning or evening
+    call_type: str = Field(..., pattern="^(morning|evening)$") 
 
 # --- Define Question Sets ---
 MORNING_QUESTIONS = [
@@ -161,56 +160,47 @@ async def index_page():
 
 @app.post("/call-user")
 async def call_user(request_body: CallUserRequest):
-    """Initiates a virtual call session, creating necessary records but NOT making a phone call."""
-    phone_number = request_body.phone_number
+    """Initiates a virtual call session for testing (no user association)."""
     call_type = request_body.call_type
-    logger.info(f"Initiating VIRTUAL {call_type} session for {phone_number}")
+    logger.info(f"Initiating VIRTUAL {call_type} session (Test User)")
     
-    user = await get_user_by_phone(phone_number)
-    if not user:
-        # Consider adding error handling if user creation fails
-        user = await create_user(phone=phone_number) 
-        logger.info(f"Created new user with ID: {user['id']}")
-    else:
-        logger.info(f"Found existing user with phone {phone_number}")
+    # --- REMOVE USER LOOKUP/CREATION ---
+    # user = await get_user_by_phone(phone_number)
+    # if not user:
+    #     user = await create_user(phone=phone_number) 
+    #     logger.info(f"Created new user with ID: {user['id']}")
+    # else:
+    #     logger.info(f"Found existing user with phone {phone_number}")
+    # For testing, we'll use a null or placeholder user ID
+    test_user_id = None 
         
     # Create a call record to track the session
     try:
         call = await create_call(
-            user_id=user['id'], 
-            status='session_initiated', # New status indicating virtual session start
+            user_id=test_user_id, # Use null/placeholder ID
+            status='session_initiated', 
             call_type=call_type 
         )
         call_record_id = call['id']
-        logger.info(f"Created call record with ID {call_record_id}")
+        logger.info(f"Created call record with ID {call_record_id} (Test User)")
 
-        # --- TWILIO CALL REMOVED --- 
-        # No longer making a Twilio call here.
-        # We still store basic info in mapping for the WebSocket to find later
-        # Note: We don't have a Twilio Call SID anymore.
-        # We might need to adjust how the websocket finds context later.
-        # For now, let's store based on call_record_id if possible or adjust mapping.
-        # Maybe the frontend sends call_record_id directly to websocket?
-        
-        # Store mapping info needed for WebSocket context
-        # Storing by call_record_id might be better now
+        # Store minimal mapping info needed for WebSocket context
         call_mapping['call_id_to_info'] = call_mapping.get('call_id_to_info', {}) # Ensure exists
         call_mapping['call_id_to_info'][call_record_id] = {
-            'user_id': user['id'], 
+            'user_id': test_user_id, 
             'call_type': call_type,
             'timestamp': datetime.datetime.now().timestamp()
-            # Removed 'call_sid'
         }
         logger.info(f"Stored session info for call record ID {call_record_id}")
         
         # Return the call_record_id needed by the frontend to connect WebSocket
         return {
-            "message": f"Virtual {call_type.capitalize()} session initiated for {phone_number}", 
+            "message": f"Virtual {call_type.capitalize()} session initiated (Test User)", 
             "call_record_id": call_record_id
         }
         
     except Exception as e:
-        logger.error(f"Error creating call record or mapping: {e}")
+        logger.error(f"Error creating call record or mapping: {e}", exc_info=True)
         # Attempt to update status to failed if call record was created
         if 'call_record_id' in locals():
            try: 
