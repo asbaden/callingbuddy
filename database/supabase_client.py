@@ -126,24 +126,41 @@ async def get_user_by_phone(phone_number):
         return {"id": "dummy-user-id", "phone_number": phone_number}
 
 # Call operations
-async def create_call(user_id, call_sid=None, status="initiated"):
+async def create_call(user_id, call_type: str = None, call_sid=None, status="initiated"):
     """Create a new call record."""
     if not supabase_available:
         logger.warning("Supabase not available - call creation skipped")
-        return {"id": "dummy-call-id", "user_id": user_id, "call_sid": call_sid}
+        # Include call_type in dummy response if provided
+        return {"id": "dummy-call-id", "user_id": user_id, "call_sid": call_sid, "call_type": call_type, "status": status}
     
     try:
         call_data = {
             "user_id": user_id,
             "call_sid": call_sid,
-            "status": status
+            "status": status,
+            "call_type": call_type # Add call_type here
         }
+        # Remove null values before inserting if DB schema requires it
+        call_data = {k: v for k, v in call_data.items() if v is not None}
         
+        logger.info(f"Inserting call data: {call_data}")
         result = supabase.table("calls").insert(call_data).execute()
-        return result.data[0] if result.data else None
+        
+        if result.data:
+            logger.info(f"Call record created successfully: {result.data[0]}")
+            return result.data[0]
+        else:
+            logger.error(f"Failed to create call record, Supabase response: {result}")
+            # Attempt to provide more info from potential error
+            error_details = getattr(result, 'error', None)
+            if error_details:
+                 logger.error(f"Supabase error details: {error_details}")
+            return None # Indicate failure
+            
     except Exception as e:
-        logger.error(f"Error creating call: {e}")
-        return {"id": "dummy-call-id", "user_id": user_id, "call_sid": call_sid}
+        logger.error(f"Error creating call: {e}", exc_info=True)
+        # Include call_type in dummy response if provided
+        return {"id": "dummy-call-id", "user_id": user_id, "call_sid": call_sid, "call_type": call_type, "status": status}
 
 async def update_call(call_id, status=None, ended_at=None, duration_seconds=None, call_sid=None):
     """Update an existing call record."""
