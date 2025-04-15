@@ -4,10 +4,6 @@ import base64
 import logging
 import asyncio
 import websockets
-import aiohttp
-import tempfile
-import subprocess
-import shutil
 from fastapi import FastAPI, WebSocket, Request, Body
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.websockets import WebSocketDisconnect
@@ -79,61 +75,6 @@ TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
 TWILIO_PHONE_NUMBER = os.getenv('TWILIO_PHONE_NUMBER')
 PORT = int(os.getenv('PORT', 5050))
 
-# Check for ffmpeg installation
-def check_ffmpeg():
-    """Check if ffmpeg is installed and try to install it if not."""
-    try:
-        # Check if ffmpeg is in the PATH
-        if shutil.which('ffmpeg'):
-            logger.info("ffmpeg is already installed")
-            return True
-            
-        # Try to install ffmpeg using apt-get if it's not found
-        logger.warning("ffmpeg not found, attempting to install...")
-        
-        # Check if we're running on Linux (likely a Render or similar service)
-        if os.name == 'posix' and not os.path.exists('/usr/bin/ffmpeg'):
-            try:
-                # Attempt installation using apt-get (for Debian/Ubuntu)
-                process = subprocess.run(
-                    ["apt-get", "update", "-y"], 
-                    capture_output=True, 
-                    text=True, 
-                    check=False
-                )
-                logger.info(f"apt-get update result: {process.returncode}")
-                
-                process = subprocess.run(
-                    ["apt-get", "install", "-y", "ffmpeg"], 
-                    capture_output=True, 
-                    text=True, 
-                    check=False
-                )
-                logger.info(f"apt-get install ffmpeg result: {process.returncode}")
-                
-                # Check if installation was successful
-                if shutil.which('ffmpeg'):
-                    logger.info("ffmpeg installation successful")
-                    return True
-                else:
-                    logger.warning("ffmpeg installation failed")
-            except Exception as e:
-                logger.error(f"Error trying to install ffmpeg: {str(e)}")
-        
-        # If we're on macOS, provide a hint for installation
-        elif os.name == 'posix' and os.path.exists('/usr/bin/sw_vers'):
-            logger.warning("On macOS, install ffmpeg using: brew install ffmpeg")
-            
-        logger.warning("ffmpeg not available - audio conversion will likely fail")
-        return False
-    except Exception as e:
-        logger.error(f"Error checking for ffmpeg: {str(e)}")
-        return False
-
-# Check for ffmpeg on startup
-ffmpeg_available = check_ffmpeg()
-logger.info(f"ffmpeg available: {ffmpeg_available}")
-
 SYSTEM_MESSAGE = (
     "You are a helpful and bubbly AI assistant who loves to chat about "
     "anything the user is interested in and is prepared to offer them facts. "
@@ -145,7 +86,8 @@ LOG_EVENT_TYPES = [
     'response.content.done', 'rate_limits.updated', 'response.done',
     'input_audio_buffer.committed', 'input_audio_buffer.speech_stopped',
     'input_audio_buffer.speech_started', 'session.created',
-    'response.text.delta', 'response.content.part', 'response.text.done'
+    'response.text.delta', 'response.content.part', 'response.text.done',
+    'input_audio_buffer.transcript'
 ]
 
 app = FastAPI()
@@ -170,418 +112,6 @@ call_mapping = {
     'call_sid_to_info': {},   # Maps Twilio call SID to call info
     'stream_sid_to_call_sid': {}  # Maps Stream SID to Twilio call SID
 }
-
-# Global variables for transcription session
-class TranscriptionService:
-    """A service to manage a transcription session with proper state handling."""
-    
-    def __init__(self):
-        self.buffer = []
-        self.audio_queue = asyncio.Queue()
-        self.processing_task = None
-        self.sending_task = None
-        self.lock = asyncio.Lock()  # Prevent multiple simultaneous session creations
-        self.state = "closed"       # States: closed, initializing, ready, error
-        self.error_count = 0
-        self.max_errors = 3
-        self.accumulated_audio = b''  # To accumulate audio data for batch processing
-        self.last_processing_time = 0
-        self.processing_interval = 5  # Increase from 3 to 5 seconds to collect more audio
-        self.min_audio_length = 8000  # Minimum audio length in bytes (about 1 second of 8kHz audio)
-        self.continuous_audio = b''   # Store all audio for one continuous transcription
-        self.continuous_interval = 60  # Process continuous audio every 60 seconds
-        self.last_continuous_time = 0
-        self.transcript_segments = []  # Store all transcript segments for post-processing
-        self.use_continuous = False    # Flag to control continuous transcription
-    
-    async def start(self):
-        """Start the transcription service if it's not already running."""
-        async with self.lock:
-            if self.state != "closed":
-                logger.info(f"Transcription service already in state: {self.state}")
-                return
-                
-            self.state = "initializing"
-            try:
-                # Verify API key is set
-                if not OPENAI_API_KEY:
-                    logger.error("OpenAI API key is not configured")
-                    self.state = "error"
-                    return False
-                
-                # Start the processing tasks if not already running
-                if not self.processing_task or self.processing_task.done():
-                    self.processing_task = asyncio.create_task(self._process_audio_queue())
-                    logger.info("Started audio queue processing task")
-                
-                self.state = "ready"
-                self.error_count = 0  # Reset error count on successful connection
-                return True
-                
-            except Exception as e:
-                logger.error(f"Failed to start transcription service: {str(e)}")
-                import traceback
-                logger.error(traceback.format_exc())
-                self.state = "error"
-                return False
-    
-    async def stop(self):
-        """Stop the transcription service cleanly."""
-        async with self.lock:
-            if self.state == "closed":
-                return
-                
-            logger.info("Stopping transcription service")
-            
-            # Cancel tasks
-            if self.processing_task and not self.processing_task.done():
-                self.processing_task.cancel()
-                logger.info("Cancelled processing task")
-                
-            if self.sending_task and not self.sending_task.done():
-                self.sending_task.cancel()
-                logger.info("Cancelled sending task")
-            
-            self.state = "closed"
-            self.error_count = 0
-            self.accumulated_audio = b''
-    
-    async def send_audio(self, audio_data):
-        """Queue audio data to be sent to the transcription service."""
-        # Start the service if needed
-        if self.state == "closed":
-            success = await self.start()
-            if not success:
-                logger.error("Failed to start transcription service")
-                return False
-        
-        # Handle error state with retries
-        if self.state == "error":
-            self.error_count += 1
-            if self.error_count > self.max_errors:
-                logger.error(f"Too many errors ({self.error_count}), stopping transcription service")
-                await self.stop()
-                return False
-                
-            # Try to restart
-            logger.info(f"Attempting to recover transcription service (attempt {self.error_count})")
-            await self.stop()
-            success = await self.start()
-            if not success:
-                return False
-        
-        # Add to the queue - non-blocking
-        try:
-            # Convert base64 audio to binary
-            binary_audio = base64.b64decode(audio_data)
-            await self.audio_queue.put(binary_audio)
-            return True
-        except Exception as e:
-            logger.error(f"Error processing audio data: {str(e)}")
-            return False
-    
-    async def _process_audio_queue(self):
-        """Process the audio queue and send batches to the transcription service."""
-        try:
-            while True:
-                current_time = asyncio.get_event_loop().time()
-                
-                # Wait for audio data
-                if not self.audio_queue.empty():
-                    audio_data = await self.audio_queue.get()
-                    self.accumulated_audio += audio_data
-                    self.continuous_audio += audio_data  # Add to continuous buffer as well
-                    self.audio_queue.task_done()
-                
-                # Process accumulated audio if enough time has passed AND we have enough audio
-                if (current_time - self.last_processing_time >= self.processing_interval 
-                    and len(self.accumulated_audio) >= self.min_audio_length):
-                    
-                    # Send accumulated audio for transcription
-                    await self._transcribe_audio(self.accumulated_audio)
-                    
-                    # Reset accumulated audio and update timer
-                    self.accumulated_audio = b''
-                    self.last_processing_time = current_time
-                elif (current_time - self.last_processing_time >= self.processing_interval 
-                    and len(self.accumulated_audio) > 0):
-                    # If we have audio but not enough, log it and wait for more
-                    logger.info(f"Not enough audio to transcribe ({len(self.accumulated_audio)} < {self.min_audio_length} bytes), waiting for more...")
-                    self.last_processing_time = current_time  # Reset timer but keep audio
-                
-                # Process continuous audio periodically for a more complete transcription
-                # But only if the flag is enabled and we have enough audio
-                if (self.use_continuous and 
-                    current_time - self.last_continuous_time >= self.continuous_interval
-                    and len(self.continuous_audio) >= self.min_audio_length * 5):  # Increased threshold for continuous
-                    
-                    # Process one continuous chunk
-                    logger.info(f"Processing continuous transcription ({len(self.continuous_audio)} bytes)")
-                    try:
-                        result = await self._transcribe_audio(self.continuous_audio, is_continuous=True)
-                        if result:
-                            # We got a successful continuous transcription, clear the buffer
-                            self.continuous_audio = b''
-                            self.last_continuous_time = current_time
-                    except Exception as e:
-                        logger.error(f"Error in continuous transcription: {str(e)}")
-                        # Reset timer but keep trying
-                        self.last_continuous_time = current_time
-                
-                # Small delay to avoid busy waiting
-                await asyncio.sleep(0.1)
-                
-        except asyncio.CancelledError:
-            logger.info("Audio queue processing task was cancelled")
-            raise
-        except Exception as e:
-            logger.error(f"Error in audio queue processing: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            self.state = "error"
-    
-    async def _transcribe_audio(self, audio_data, is_continuous=False):
-        """Send audio data to OpenAI Whisper API for transcription."""
-        if not audio_data or len(audio_data) < self.min_audio_length:  # Skip very small audio chunks
-            logger.warning(f"Audio too short for transcription: {len(audio_data)} bytes")
-            return False
-            
-        logger.info(f"Sending {len(audio_data)} bytes of audio for transcription{' (continuous)' if is_continuous else ''}")
-        
-        try:
-            # Save audio to a temporary file
-            with tempfile.NamedTemporaryFile(suffix=".ulaw", delete=False) as temp_file:
-                temp_filename = temp_file.name
-                temp_file.write(audio_data)
-            
-            # Convert ulaw to wav using ffmpeg
-            wav_filename = temp_filename + ".wav"
-            conversion_successful = False
-            
-            # Try ffmpeg conversion first
-            if ffmpeg_available:
-                try:
-                    # Run ffmpeg to convert from ulaw to wav
-                    cmd = [
-                        "ffmpeg", 
-                        "-f", "mulaw", 
-                        "-ar", "8000",  # g711 is usually 8kHz
-                        "-i", temp_filename, 
-                        "-ar", "16000",  # Convert to 16kHz for better transcription
-                        "-ac", "1",      # Mono
-                        "-acodec", "pcm_s16le", # Explicitly set 16-bit PCM Little Endian
-                        "-f", "wav", 
-                        wav_filename
-                    ]
-                    
-                    process = await asyncio.create_subprocess_exec(
-                        *cmd,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE
-                    )
-                    stdout, stderr = await process.communicate()
-                    
-                    if process.returncode != 0:
-                        logger.error(f"ffmpeg conversion failed: {stderr.decode()}")
-                    else:
-                        logger.info(f"Successfully converted ulaw to wav: {wav_filename}")
-                        conversion_successful = True
-                except Exception as conv_error:
-                    logger.error(f"Error during ffmpeg audio conversion: {str(conv_error)}")
-                    # Will fall through to fallback method
-            
-            # If ffmpeg conversion didn't work, try fallback method
-            if not conversion_successful:
-                try:
-                    logger.info("Attempting fallback audio conversion")
-                    
-                    # Simple conversion - G.711 μ-law is just a specific encoding of 8-bit PCM
-                    # We'll decode it to 16-bit PCM for a valid WAV file that OpenAI can process
-                    
-                    # Create WAV header (44 bytes for standard header)
-                    # This creates a very simple 16-bit PCM WAV with 8kHz sample rate
-                    with open(wav_filename, 'wb') as wav_file:
-                        # RIFF header
-                        wav_file.write(b'RIFF')
-                        # Filesize placeholder (filled in later)
-                        wav_file.write(b'\x00\x00\x00\x00')
-                        # WAVE header
-                        wav_file.write(b'WAVE')
-                        # fmt chunk
-                        wav_file.write(b'fmt ')
-                        # fmt chunk size (16 bytes)
-                        wav_file.write(b'\x10\x00\x00\x00')
-                        # PCM format (1)
-                        wav_file.write(b'\x01\x00')
-                        # Mono (1 channel)
-                        wav_file.write(b'\x01\x00')
-                        # Sample rate (8000 Hz)
-                        wav_file.write(b'\x40\x1F\x00\x00')
-                        # Byte rate (8000*2 bytes)
-                        wav_file.write(b'\x80\x3E\x00\x00')
-                        # Block align (2 bytes per sample * 1 channel)
-                        wav_file.write(b'\x02\x00')
-                        # Bits per sample (16)
-                        wav_file.write(b'\x10\x00')
-                        # data chunk
-                        wav_file.write(b'data')
-                        # data size placeholder (filled in later)
-                        wav_file.write(b'\x00\x00\x00\x00')
-                        
-                        # Convert the μ-law audio to linear PCM
-                        # Each μ-law byte becomes a 16-bit PCM sample
-                        with open(temp_filename, 'rb') as ulaw_file:
-                            ulaw_data = ulaw_file.read()
-                            
-                            # Simple μ-law to PCM conversion table
-                            # This is a very simple conversion and not perfect,
-                            # but should work well enough for speech recognition
-                            ulaw_to_linear = [
-                                0, 132, 396, 924, 1980, 4092, 8316, 16764,
-                                -132, -396, -924, -1980, -4092, -8316, -16764, -32767,
-                                # ... many more values here, simplified for brevity
-                            ]
-                            
-                            for byte in ulaw_data:
-                                # Very simplified conversion - actual μ-law decoding would be more complex
-                                # For now, just ensure we create valid 16-bit PCM data that might work
-                                # with the transcription API
-                                pcm_value = int(byte) * 256  # Simple scaling
-                                if pcm_value > 32767:
-                                    pcm_value = 32767
-                                elif pcm_value < -32768:
-                                    pcm_value = -32768
-                                    
-                                # Write 16-bit PCM value (little endian)
-                                wav_file.write(pcm_value.to_bytes(2, byteorder='little', signed=True))
-                        
-                        # Fill in file size in header
-                        file_size = wav_file.tell()
-                        wav_file.seek(4)
-                        wav_file.write((file_size - 8).to_bytes(4, byteorder='little'))
-                        
-                        # Fill in data size in header
-                        data_size = file_size - 44  # 44 is the header size
-                        wav_file.seek(40)
-                        wav_file.write(data_size.to_bytes(4, byteorder='little'))
-                    
-                    if os.path.exists(wav_filename) and os.path.getsize(wav_filename) > 44:
-                        logger.info(f"Fallback conversion successful: {wav_filename}")
-                        conversion_successful = True
-                    else:
-                        logger.error("Fallback conversion failed to produce valid wav file")
-                except Exception as fallback_error:
-                    logger.error(f"Fallback audio conversion failed: {str(fallback_error)}")
-            
-            # If we couldn't convert the file, return early
-            if not conversion_successful:
-                logger.error("All audio conversion methods failed")
-                self.state = "error"
-                return False
-            
-            # Define headers and data for the request
-            headers = {
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-            }
-            
-            # Prepare form data with the audio file
-            data = aiohttp.FormData()
-            data.add_field('file', open(wav_filename, 'rb'), filename='audio.wav')
-            data.add_field('model', 'whisper-1')
-            data.add_field('language', 'en')
-            data.add_field('response_format', 'json')
-            
-            # For continuous transcription, add prompt with previous segments
-            if is_continuous and self.transcript_segments:
-                recent_segments = " ".join(self.transcript_segments[-5:])  # Use last 5 segments as context
-                data.add_field('prompt', f"Previous segments: {recent_segments}")
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    'https://api.openai.com/v1/audio/transcriptions',
-                    headers=headers,
-                    data=data
-                ) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        transcription = result.get('text', '')
-                        
-                        if transcription:
-                            logger.info(f"Transcription result{' (continuous)' if is_continuous else ''}: {transcription}")
-                            
-                            # Filter out very short or likely inaccurate transcriptions
-                            if len(transcription.strip()) < 3 or transcription.strip().lower() in ["you", "bye", "hello", "uh", "um"]:
-                                logger.warning(f"Discarding likely inaccurate short transcription: '{transcription.strip()}'")
-                                return True # Return true so we don't trigger error state, but don't add to buffer
-                                
-                            # Store the raw segment for future context
-                            self.transcript_segments.append(transcription.strip())
-                            
-                            # For continuous transcription, only replace if it looks significantly different 
-                            # from what we already have (to avoid replacing good incremental transcriptions)
-                            if is_continuous:
-                                if not transcription.strip():
-                                    logger.info("Empty continuous transcription, ignoring")
-                                    return True
-                                    
-                                # Log current buffer for comparison
-                                current_content = " ".join([msg.replace("User: ", "") for msg in self.buffer])
-                                logger.info(f"Current buffer content: '{current_content}'")
-                                logger.info(f"Continuous transcription: '{transcription.strip()}'")
-                                
-                                # Check if the continuous transcription adds significant value
-                                # Only replace if the buffer is empty or continuous is much longer
-                                if len(self.buffer) == 0 or len(transcription) > len(current_content) * 2.0:
-                                    # Replace the buffer with a more complete transcription
-                                    self.buffer = [f"User: {transcription.strip()}"]
-                                    logger.info(f"Updated buffer with continuous transcription (significant improvement)")
-                                else:
-                                    logger.info(f"Keeping existing buffer (continuous transcription not better)")
-                            else:
-                                # Add to buffer (regular incremental transcription)
-                                if transcription.strip():
-                                    self.buffer.append(f"User: {transcription}")
-                                
-                            return True
-                    else:
-                        error_text = await response.text()
-                        logger.error(f"Transcription API error: {response.status} - {error_text}")
-                        
-                        # Check if this is an authentication error
-                        if response.status == 401:
-                            logger.error("Authentication error: Invalid API key or insufficient permissions")
-                        elif response.status == 400:
-                            logger.error("Bad request: The API couldn't process the audio format")
-                        
-                        self.state = "error"
-                        return False
-            
-            # Clean up the temporary files
-            try:
-                os.unlink(temp_filename)
-                if os.path.exists(wav_filename):
-                    os.unlink(wav_filename)
-            except Exception as e:
-                logger.error(f"Error removing temporary files: {str(e)}")
-                
-        except Exception as e:
-            logger.error(f"Error in transcription: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            self.state = "error"
-            return False
-
-    async def get_buffer(self):
-        """Get a copy of the current transcription buffer."""
-        return self.buffer.copy()
-        
-    def clear_buffer(self):
-        """Clear the transcription buffer."""
-        self.buffer = []
-        return True
-
-# Initialize the transcription service
-transcription_service = TranscriptionService()
 
 @app.get("/", response_class=JSONResponse)
 async def index_page():
@@ -740,17 +270,9 @@ async def handle_media_stream(websocket: WebSocket):
                             "audio": data['media']['payload']
                         }
                         
-                        # Send to conversation API (existing functionality)
+                        # Send ONLY to conversation API 
                         await openai_ws.send(json.dumps(audio_append))
                         
-                        # Also send to transcription service (new functionality)
-                        try:
-                            # Send audio to transcription service (non-blocking)
-                            asyncio.create_task(send_audio_for_transcription(data['media']['payload']))
-                        except Exception as transcription_error:
-                            # Log but don't interrupt the main conversation flow
-                            logger.error(f"Error sending to transcription: {str(transcription_error)}")
-                            
                     elif data['event'] == 'start':
                         stream_sid = data['start']['streamSid']
                         logger.info(f"Incoming stream has started {stream_sid}")
@@ -777,18 +299,10 @@ async def handle_media_stream(websocket: WebSocket):
                 # Always mark the WebSocket as closed when this task exits
                 websocket_closed = True
                 
-                # Stop the transcription session if it's running
-                global transcription_service
-                if transcription_service.state != "closed":
-                    try:
-                        await transcription_service.stop()
-                        logger.info("Closed transcription session")
-                    except Exception as e:
-                        logger.error(f"Error closing transcription session: {str(e)}")
-
         async def send_to_twilio():
             """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
             nonlocal stream_sid, full_transcription, websocket_closed
+            current_ai_message = "" # Accumulate delta messages
             try:
                 async for openai_message in openai_ws:
                     response = json.loads(openai_message)
@@ -796,65 +310,42 @@ async def handle_media_stream(websocket: WebSocket):
                     # Log all response types - better for debugging
                     logger.info(f"OpenAI event: {response['type']}")
                     
-                    # Record transcribed text - expanded debug logging
-                    # Various ways OpenAI might send text content
-                    if response['type'] == 'response.content.part' and 'content' in response:
-                        content = response.get('content', '')
-                        logger.info(f"AI RESPONSE (content.part): '{content}'")
-                        
-                        if content:  # Only process non-empty content
-                            if full_transcription and full_transcription[-1].startswith("AI:"):
-                                # Append to previous AI message to form complete sentences
-                                full_transcription[-1] += content
-                                logger.info(f"Updated AI message: '{full_transcription[-1]}'")
-                            else:
-                                # Start a new AI message
-                                full_transcription.append(f"AI: {content}")
-                                logger.info(f"Added new AI message: '{full_transcription[-1]}'")
-                    
-                    elif response['type'] == 'response.text.delta' and 'delta' in response:
+                    # --- Capture AI Text --- 
+                    # Accumulate text deltas
+                    if response['type'] == 'response.text.delta' and 'delta' in response:
                         delta = response.get('delta', '')
                         logger.info(f"AI RESPONSE (text.delta): '{delta}'")
-                        
-                        if delta:  # Only process non-empty delta
-                            if full_transcription and full_transcription[-1].startswith("AI:"):
-                                # Append to previous AI message to form complete sentences
-                                full_transcription[-1] += delta
-                                logger.info(f"Updated AI message: '{full_transcription[-1]}'")
-                            else:
-                                # Start a new AI message
-                                full_transcription.append(f"AI: {delta}")
-                                logger.info(f"Added new AI message: '{full_transcription[-1]}'")
+                        if delta:
+                            current_ai_message += delta
                     
-                    # Handle transcript completed event
-                    elif response['type'] == 'response.text.done' and 'text' in response:
-                        text = response.get('text', '')
-                        logger.info(f"AI RESPONSE COMPLETED: '{text}'")
-                        
-                        if text:  # Only process non-empty text
-                            message = f"AI: {text}"
-                            # Replace partial message with complete one if exists
-                            if full_transcription and full_transcription[-1].startswith("AI:"):
-                                full_transcription[-1] = message
-                                logger.info(f"Replaced AI message with complete text: '{message}'")
-                            else:
-                                full_transcription.append(message)
-                                logger.info(f"Added completed AI message: '{message}'")
-                    
-                    # User transcription from input audio
+                    # Finalize AI message when done
+                    elif response['type'] == 'response.text.done' and current_ai_message:
+                        logger.info(f"AI RESPONSE COMPLETED: '{current_ai_message}'")
+                        if current_ai_message.strip(): # Avoid adding empty messages
+                            full_transcription.append(f"AI: {current_ai_message.strip()}")
+                        current_ai_message = "" # Reset accumulator
+
+                    # --- Capture User Text --- 
+                    # User transcription from input audio buffer event
                     elif response['type'] == 'input_audio_buffer.transcript' and 'transcript' in response:
                         transcript = response.get('transcript', '')
                         logger.info(f"USER TRANSCRIPT: '{transcript}'")
                         
-                        if transcript:  # Only process non-empty transcript
-                            message = f"User: {transcript}"
-                            full_transcription.append(message)
-                            logger.info(f"Added user message: '{message}'")
+                        if transcript and transcript.strip(): # Avoid adding empty messages
+                            # Filter common noise/short utterances if needed
+                            if len(transcript.strip()) < 3 or transcript.strip().lower() in ["you", "bye", "hello", "uh", "um"]:
+                                logger.warning(f"Discarding likely inaccurate short user transcript: '{transcript.strip()}'")
+                            else:
+                                message = f"User: {transcript.strip()}"
+                                full_transcription.append(message)
+                                logger.info(f"Added user message: '{message}'")
                     
-                    if response['type'] == 'session.updated':
+                    # --- Session/Control Events --- 
+                    elif response['type'] == 'session.updated':
                         logger.info("Session updated successfully")
                         
-                    if response['type'] == 'response.audio.delta' and response.get('delta'):
+                    # --- Send Audio to Twilio --- 
+                    elif response['type'] == 'response.audio.delta' and response.get('delta'):
                         # Audio from OpenAI
                         try:
                             if not websocket_closed:
@@ -903,75 +394,26 @@ async def handle_media_stream(websocket: WebSocket):
                 pass
                 
         # Clean up and save the transcription
-        # Log the transcription even if we can't save it to a specific call
-        if full_transcription or transcription_service.buffer:
-            # Merge the transcription buffer with the full transcription
-            final_transcription = []
+        # Use ONLY full_transcription list
+        if full_transcription:
+            # Remove logic related to transcription_service.buffer
+            # Remove logic related to processing final continuous transcription
             
-            # Process transcriptions from the OpenAI conversation API
-            has_real_time_transcripts = bool(full_transcription)
-            if has_real_time_transcripts:
-                logger.info(f"Adding {len(full_transcription)} items from real-time transcription")
+            # Log the available transcriptions for debugging
+            logger.info(f"--- REAL-TIME TRANSCRIPTION (FINAL) ---")
+            for idx, msg in enumerate(full_transcription):
+                logger.info(f"[{idx}] {msg}")
+            logger.info(f"--- END REAL-TIME TRANSCRIPTION ---")
             
-            # Get transcriptions from our custom transcription service
-            if transcription_service.buffer:
-                # Process final continuous transcription if available
-                if len(transcription_service.continuous_audio) >= transcription_service.min_audio_length:
-                    try:
-                        logger.info(f"Processing final continuous transcription ({len(transcription_service.continuous_audio)} bytes)")
-                        # Process the remaining continuous audio without clearing the buffer
-                        await transcription_service._transcribe_audio(
-                            transcription_service.continuous_audio, 
-                            is_continuous=True
-                        )
-                    except Exception as e:
-                        logger.error(f"Error processing final transcription: {e}")
-                
-                # Log the available transcriptions for debugging
-                logger.info(f"=== AVAILABLE TRANSCRIPTIONS ===")
-                logger.info(f"--- CUSTOM TRANSCRIPTION BUFFER ---")
-                for idx, msg in enumerate(transcription_service.buffer):
-                    logger.info(f"[{idx}] {msg}")
-                
-                logger.info(f"--- REAL-TIME TRANSCRIPTION ---")
-                for idx, msg in enumerate(full_transcription):
-                    logger.info(f"[{idx}] {msg}")
-                logger.info(f"=== END AVAILABLE TRANSCRIPTIONS ===")
-                
-                logger.info(f"Adding {len(transcription_service.buffer)} items from custom transcription service")
-                
-                # Important change: Filter custom buffer again for likely noise
-                filtered_custom_buffer = [msg for msg in transcription_service.buffer 
-                                        if not (msg.startswith("User:") and 
-                                                (len(msg.replace("User: ", "").strip()) < 3 or 
-                                                 msg.replace("User: ", "").strip().lower() in ["you", "bye", "hello", "uh", "um"]))]
-                logger.info(f"Custom buffer reduced to {len(filtered_custom_buffer)} items after filtering noise")
-                
-                # Get AI messages from the real-time transcript
-                ai_msgs = [msg for msg in full_transcription if msg.startswith("AI:")]
-                logger.info(f"Found {len(ai_msgs)} AI messages in real-time transcription")
-                
-                # Determine the best source for user messages
-                if filtered_custom_buffer:
-                    # Prioritize the filtered custom buffer if it has content
-                    logger.info(f"Using {len(filtered_custom_buffer)} filtered custom transcriptions for user messages")
-                    user_msgs = filtered_custom_buffer
-                else:
-                    # Fallback to real-time user messages if custom buffer is empty/filtered out
-                    user_msgs = [msg for msg in full_transcription if msg.startswith("User:")]
-                    logger.info(f"Using {len(user_msgs)} real-time transcriptions for user messages")
-                
-                # Assemble the final transcript: User messages first, then AI messages
-                final_transcription = user_msgs + ai_msgs
-            else:
-                # No custom transcription service results, rely solely on real-time
-                logger.info("Using only real-time transcription as custom buffer is empty")
-                final_transcription = full_transcription
+            # Assemble the final transcript (already contains User and AI messages)
+            final_transcription = full_transcription # It's already combined
             
             # Remove duplicates while preserving order
             seen = set()
             unique_transcription = []
             for item in final_transcription:
+                # Simple check to combine potential fragmented AI messages if needed
+                # (More sophisticated merging could be added if needed)
                 if item not in seen:
                     seen.add(item)
                     unique_transcription.append(item)
@@ -1055,6 +497,8 @@ async def handle_media_stream(websocket: WebSocket):
                         logger.warning("No matching call found in our mapping - transcription not saved to database")
                 except Exception as db_error:
                     logger.error(f"Failed to save transcription to database: {db_error}")
+        else:
+             logger.warning("No transcription data captured during the call.")
         
         # Make sure everything is closed
         if openai_ws.open:
@@ -1072,9 +516,13 @@ async def send_session_update(openai_ws):
             "instructions": SYSTEM_MESSAGE,
             "modalities": ["text", "audio"],
             "temperature": 0.8,
+            "input_audio_transcription": {  # Explicitly enable transcription
+                "model": "whisper-1",       # Or another suitable model if needed
+                "language": "en"            # Specify language
+            }
         }
     }
-    logger.info('Sending session update to OpenAI')
+    logger.info('Sending session update to OpenAI with transcription enabled')
     await openai_ws.send(json.dumps(session_update))
 
 # New endpoints for working with transcriptions
@@ -1211,68 +659,6 @@ async def debug_key_format():
     }
     
     return JSONResponse(content=results)
-
-async def send_audio_for_transcription(audio_data):
-    """Send audio data to the transcription service."""
-    global transcription_service
-    
-    if transcription_service.state == "closed":
-        success = await transcription_service.start()
-        if not success:
-            logger.error("Failed to start transcription service")
-            return False
-    
-    return await transcription_service.send_audio(audio_data)
-
-@app.get("/test-transcription")
-async def test_transcription():
-    """Test endpoint for the transcription functionality."""
-    global transcription_service
-    
-    # Clean up any existing session
-    if transcription_service.state != "closed":
-        await transcription_service.stop()
-    
-    transcription_service.clear_buffer()
-    
-    # Create a new transcription session
-    try:
-        success = await transcription_service.start()
-        if not success:
-            return JSONResponse(
-                status_code=500,
-                content={"error": "Failed to create transcription session"}
-            )
-        
-        # Send a test audio snippet (in a real scenario, this would be voice data)
-        # This is just a placeholder - you would need real audio data
-        test_audio = "VGVzdCBhdWRpbyBkYXRhIC0gbm90IHJlYWwgYXVkaW8="  # Base64 "Test audio data - not real audio"
-        success = await transcription_service.send_audio(test_audio)
-        
-        # Wait a moment to see if we get any response
-        await asyncio.sleep(2)
-        
-        # Get the current buffer
-        buffer = await transcription_service.get_buffer()
-        
-        return JSONResponse(
-            status_code=200,
-            content={
-                "status": "success" if success else "error",
-                "message": "Transcription test completed",
-                "state": transcription_service.state,
-                "buffer": buffer
-            }
-        )
-    except Exception as e:
-        logger.error(f"Error in test-transcription endpoint: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-        
-        return JSONResponse(
-            status_code=500,
-            content={"error": f"Transcription test failed: {str(e)}"}
-        )
 
 if __name__ == "__main__":
     import uvicorn
