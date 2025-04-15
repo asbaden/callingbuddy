@@ -96,13 +96,20 @@ LOG_EVENT_TYPES = [
 
 app = FastAPI()
 
-# Add CORS middleware to allow requests from the mobile app
+# Add CORS middleware 
+origins = [
+    "http://localhost:3000",  # Allow your local frontend
+    "http://127.0.0.1:3000", # Alternative local address
+    "https://callingbuddy.onrender.com", # Allow the deployed frontend/backend itself
+    # Add any other origins if needed, e.g., your deployed frontend URL if different
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify your app's domain
+    allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
 )
 
 if not OPENAI_API_KEY:
