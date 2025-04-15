@@ -7,6 +7,7 @@ document.addEventListener('DOMContentLoaded', function() {
     const callButton = document.getElementById('callButton');
     const buttonText = callButton.querySelector('#buttonText'); // Use # for ID selector
     const spinner = callButton.querySelector('#spinner');    // Use # for ID selector
+    const endCallButton = document.getElementById('endCallButton'); // Get the new button
     const resultDiv = document.getElementById('result');
     const logsOutput = document.getElementById('logsOutput'); // Corrected log output ID
     const transcriptArea = document.getElementById('transcriptArea');
@@ -17,6 +18,8 @@ document.addEventListener('DOMContentLoaded', function() {
     
     // Add event listener for the call button
     callButton.addEventListener('click', initiateCall);
+    // Add event listener for the end call button
+    endCallButton.addEventListener('click', endWebSocketSession);
     
     // Log function
     function log(message) {
@@ -99,8 +102,10 @@ document.addEventListener('DOMContentLoaded', function() {
                 
                 startWebSocketSession(callRecordId);
                 
-                // Keep button disabled, update text
-                buttonText.textContent = 'Session Active';
+                // Update UI for active session
+                callButton.classList.add('hidden'); // Hide Start button
+                endCallButton.classList.remove('hidden'); // Show End button
+                buttonText.textContent = 'Session Active'; // Maybe update status elsewhere
 
             } else {
                 // ERROR
@@ -114,6 +119,8 @@ document.addEventListener('DOMContentLoaded', function() {
                 callButton.disabled = false;
                 spinner.classList.add('hidden');
                 buttonText.textContent = 'Start AI Session';
+                callButton.classList.remove('hidden'); // Ensure start button is visible
+                endCallButton.classList.add('hidden'); // Ensure end button is hidden
             }
         } catch (error) {
             // Network error
@@ -123,6 +130,8 @@ document.addEventListener('DOMContentLoaded', function() {
             callButton.disabled = false;
             spinner.classList.add('hidden');
             buttonText.textContent = 'Start AI Session';
+            callButton.classList.remove('hidden'); // Ensure start button is visible
+            endCallButton.classList.add('hidden'); // Ensure end button is hidden
         } 
     }
     
@@ -151,6 +160,9 @@ document.addEventListener('DOMContentLoaded', function() {
         websocket.onopen = async (event) => { // Make onopen async
             log('WebSocket connection established.');
             showResult('Connected to AI. Session active.');
+            // Show End button, hide Start (already handled in initiateCall success)
+            callButton.classList.add('hidden');
+            endCallButton.classList.remove('hidden');
             
             // --- START MICROPHONE CAPTURE --- 
             try {
@@ -208,6 +220,8 @@ document.addEventListener('DOMContentLoaded', function() {
             callButton.disabled = false;
             spinner.classList.add('hidden');
             buttonText.textContent = 'Start AI Session';
+            callButton.classList.remove('hidden'); // Show Start button
+            endCallButton.classList.add('hidden');   // Hide End button
         };
 
         websocket.onclose = (event) => {
@@ -231,7 +245,24 @@ document.addEventListener('DOMContentLoaded', function() {
             callButton.disabled = false;
             spinner.classList.add('hidden');
             buttonText.textContent = 'Start AI Session';
+            callButton.classList.remove('hidden'); // Show Start button
+            endCallButton.classList.add('hidden');   // Hide End button
         };
+    }
+    
+    // --- NEW FUNCTION: End WebSocket Session --- 
+    function endWebSocketSession() {
+        log('User initiated session end.');
+        if (websocket && websocket.readyState === WebSocket.OPEN) {
+            websocket.close(1000, "User ended session"); // Use code 1000 for normal closure
+        }
+        // Stop microphone etc. will be handled by the onclose handler
+        // Manually update button state immediately for better UX
+        callButton.disabled = false; 
+        callButton.classList.remove('hidden');
+        endCallButton.classList.add('hidden');
+        buttonText.textContent = 'Start AI Session';
+        showResult('Session ended by user.');
     }
     
     // Initial log
