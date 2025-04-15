@@ -223,142 +223,139 @@ async def call_user(request_body: CallUserRequest):
 async def handle_media_stream(websocket: WebSocket, call_record_id: str = None):
     """Handle WebSocket connections directly from the frontend for virtual calls."""
     await websocket.accept()
-    logger.info(f"Frontend client connected to media stream for call_record_id: {call_record_id}")
+    logger.info(f"Frontend client connected for call_record_id: {call_record_id}")
     
+    # --- State Initialization --- 
     if not call_record_id:
         logger.error("Missing call_record_id query parameter. Closing connection.")
         await websocket.close(code=1008, reason="Missing call_record_id")
         return
-        
-    # Retrieve call info using call_record_id from the mapping
     call_info = call_mapping.get('call_id_to_info', {}).get(call_record_id)
     if not call_info:
         logger.error(f"Could not find call info for call_record_id {call_record_id}. Closing connection.")
         await websocket.close(code=1008, reason="Invalid call_record_id")
         return
-        
     call_type = call_info.get('call_type', 'unknown')
     user_id = call_info.get('user_id')
+    await update_call(call_id=call_record_id, status='active')
     logger.info(f"Session started for User: {user_id}, Call Type: {call_type}")
 
-    # Update call status to active
-    await update_call(call_id=call_record_id, status='active')
-
     full_transcription = []
-    websocket_closed = False
     current_question_index = 0
     awaiting_answer = False 
-    stream_sid = f"frontend_ws_{call_record_id}" # Create a unique ID for logging/mapping if needed
+    current_ai_speech_transcript = "" # Moved state here
+    # --- End State Initialization --- 
     
-    async with websockets.connect(
-        'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01',
-        extra_headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "OpenAI-Beta": "realtime=v1"
-        }
-    ) as openai_ws:
-        await send_session_update(openai_ws) # Ensure this includes transcription config
-        
-        # Ask the first question immediately upon connection
-        await ask_next_question(openai_ws, call_type, current_question_index)
-        awaiting_answer = True # Expecting user to potentially speak first
+    try:
+        async with websockets.connect(
+            'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01',
+            extra_headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "OpenAI-Beta": "realtime=v1"
+            }
+        ) as openai_ws:
+            await send_session_update(openai_ws) 
+            await ask_next_question(openai_ws, call_type, current_question_index)
+            awaiting_answer = True 
 
-        async def process_frontend_message(message_data):
-            """Process messages coming FROM Frontend (audio)."""
-            nonlocal awaiting_answer
-            # Expecting JSON like: { "event": "media", "audio": "base64..." } 
-            if message_data.get('event') == 'media' and 'audio' in message_data and openai_ws.open:
-                logger.debug("Received audio chunk from frontend")
-                audio_append = {
-                    "type": "input_audio_buffer.append",
-                    "audio": message_data['audio'] # Expecting base64 string
-                }
-                await openai_ws.send(json.dumps(audio_append))
-                # Don't set awaiting_answer here, let OpenAI's transcript event handle it
-            else:
-                logger.warning(f"Received unexpected message from frontend: {message_data}")
+            async def process_frontend_message(message_data):
+                if message_data.get('event') == 'media' and 'audio' in message_data and openai_ws.open:
+                    logger.debug("Received audio chunk from frontend")
+                    audio_append = {
+                        "type": "input_audio_buffer.append",
+                        "audio": message_data['audio']
+                    }
+                    await openai_ws.send(json.dumps(audio_append))
+                else:
+                    logger.warning(f"Received unexpected message from frontend: {message_data}")
 
-        async def process_openai_response(response_data):
-            """Process responses coming FROM OpenAI (text, audio, events)."""
-            nonlocal full_transcription, current_question_index, awaiting_answer
-            current_ai_speech_transcript = "" 
-            
-            # --- Capture AI Speech Transcription --- 
-            if response_data['type'] == 'response.audio_transcript.delta' and 'delta' in response_data:
-                delta = response_data.get('delta', '')
-                logger.info(f"AI SPEECH TRANSCRIPT (delta): '{delta}'")
-                if delta:
-                    current_ai_speech_transcript += delta
-            
-            elif response_data['type'] == 'response.audio_transcript.done' and current_ai_speech_transcript:
-                final_transcript = response_data.get('transcript', current_ai_speech_transcript).strip()
-                logger.info(f"AI SPEECH TRANSCRIPT COMPLETED: '{final_transcript}'")
-                if final_transcript:
-                    full_transcription.append(f"AI: {final_transcript}")
-                current_ai_speech_transcript = "" 
-            
-            # --- Capture User Speech Transcription --- 
-            elif response_data['type'] == 'conversation.item.input_audio_transcription.completed' and 'transcript' in response_data:
-                transcript = response_data.get('transcript', '')
-                logger.info(f"USER TRANSCRIPT (completed): '{transcript}'")
+            async def process_openai_response(response_data):
+                nonlocal full_transcription, current_question_index, awaiting_answer, current_ai_speech_transcript
                 
-                if transcript and transcript.strip(): 
-                    # Filter common noise/short utterances if needed
-                    if len(transcript.strip()) < 3 or transcript.strip().lower() in ["you", "bye", "hello", "uh", "um"]:
-                        logger.warning(f"Discarding likely inaccurate short user transcript: '{transcript.strip()}'")
-                    else:
-                        message = f"User: {transcript.strip()}"
+                logger.info(f"OpenAI event: {response_data['type']}")
+                # --- Capture AI Speech Transcription --- 
+                if response_data['type'] == 'response.audio_transcript.delta' and 'delta' in response_data:
+                    delta = response_data.get('delta', '')
+                    # logger.info(f"AI SPEECH TRANSCRIPT (delta): '{delta}'") # Can be too verbose
+                    if delta:
+                        current_ai_speech_transcript += delta
+                
+                elif response_data['type'] == 'response.audio_transcript.done': # Check type first
+                    final_transcript = response_data.get('transcript', current_ai_speech_transcript).strip()
+                    logger.info(f"AI SPEECH TRANSCRIPT COMPLETED: '{final_transcript}'")
+                    if final_transcript:
+                        message = f"AI: {final_transcript}"
                         full_transcription.append(message)
-                        logger.info(f"Added user message: '{message}'")
-                        
-                        # User has answered, move to next question
-                        awaiting_answer = False # No longer waiting for this answer
-                        current_question_index += 1
-                        await ask_next_question(openai_ws, call_type, current_question_index)
-                        awaiting_answer = True # Now waiting for answer to the *new* question
+                        await send_transcript_to_frontend(websocket, "AI", final_transcript)
+                    current_ai_speech_transcript = "" # Reset accumulator
+                
+                # --- Capture User Speech Transcription --- 
+                elif response_data['type'] == 'conversation.item.input_audio_transcription.completed' and 'transcript' in response_data:
+                    transcript = response_data.get('transcript', '')
+                    logger.info(f"USER TRANSCRIPT (completed): '{transcript}'")
+                    
+                    if transcript and transcript.strip(): 
+                        if len(transcript.strip()) < 3 or transcript.strip().lower() in ["you", "bye", "hello", "uh", "um"]:
+                            logger.warning(f"Discarding likely inaccurate short user transcript: '{transcript.strip()}'")
+                        else:
+                            message_text = transcript.strip()
+                            message = f"User: {message_text}"
+                            full_transcription.append(message)
+                            logger.info(f"Added user message: '{message}'")
+                            await send_transcript_to_frontend(websocket, "User", message_text)
+                            
+                            # User has answered, move to next question
+                            awaiting_answer = False 
+                            current_question_index += 1
+                            await ask_next_question(openai_ws, call_type, current_question_index)
+                            awaiting_answer = True 
 
-            # --- Send Audio to Frontend --- 
-            elif response_data['type'] == 'response.audio.delta' and response_data.get('delta'):
-                # We need to send audio back to the frontend client
-                audio_b64 = response_data['delta']
-                logger.debug("Sending audio chunk to frontend")
-                audio_message = {
-                    "event": "audio",
-                    "audio": audio_b64
-                }
-                await websocket.send_json(audio_message) # Send direct to frontend WS
+                # --- Send Audio to Frontend --- 
+                elif response_data['type'] == 'response.audio.delta' and response_data.get('delta'):
+                    audio_b64 = response_data['delta']
+                    # logger.debug("Sending audio chunk to frontend") # Can be too verbose
+                    audio_message = {"event": "audio", "audio": audio_b64}
+                    await websocket.send_json(audio_message)
+                
+                # --- Other Events --- 
+                elif response_data['type'] == 'session.updated':
+                    logger.info("Session updated successfully")
+                elif response_data['type'] == 'response.done':
+                    logger.info("OpenAI response.done received")
+                    # Important: We set awaiting_answer=True *only* after AI finishes speaking *a question*
+                    # This assumes ask_next_question was the last thing that triggered the response.
+                    # If AI speaks unprompted, this logic might need adjustment.
+                    # Let's refine: only set awaiting_answer=True if we know AI just asked a question.
+                    # We can infer this if the last full_transcription entry was an AI message from MORNING/EVENING lists.
+                    # For simplicity now, let's assume response.done for AI means it finished asking the question.
+                    awaiting_answer = True 
+
+            # --- Main Loop --- 
+            frontend_task = asyncio.create_task(frontend_message_processor(websocket, process_frontend_message))
+            openai_task = asyncio.create_task(openai_response_processor(openai_ws, process_openai_response))
             
-            # Other events (session.updated, etc.) - log if needed
-            elif response_data['type'] == 'session.updated':
-                 logger.info("Session updated successfully")
-            elif response_data['type'] == 'response.done':
-                 logger.info("OpenAI response.done received")
-                 # After AI finishes speaking the question, we are definitely waiting for an answer
-                 awaiting_answer = True 
-
-        # --- Main Loop --- 
-        frontend_task = asyncio.create_task(frontend_message_processor(websocket, process_frontend_message))
-        openai_task = asyncio.create_task(openai_response_processor(openai_ws, process_openai_response))
-        
-        done, pending = await asyncio.wait(
-            [frontend_task, openai_task],
-            return_when=asyncio.FIRST_COMPLETED
-        )
-        
-        websocket_closed = True
-        for task in pending:
-            task.cancel()
-            try: await task
-            except asyncio.CancelledError: pass
-        
+            done, pending = await asyncio.wait(
+                [frontend_task, openai_task],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            
+            for task in pending:
+                task.cancel()
+                try: await task
+                except asyncio.CancelledError: pass
+            
+    except websockets.exceptions.ConnectionClosed as e:
+        logger.warning(f"OpenAI WebSocket connection closed: {e.code} {e.reason}")
+    except Exception as e:
+        logger.error(f"Error during WebSocket handling: {e}", exc_info=True)
+    finally:
         # Final cleanup and saving
         logger.info(f"WebSocket session ending for call_record_id: {call_record_id}")
-        save_final_transcription(full_transcription, call_record_id, call_mapping) # Pass call_record_id
-
-        if openai_ws.open:
+        save_final_transcription(full_transcription, call_record_id, call_mapping)
+        if openai_ws and openai_ws.open:
             await openai_ws.close()
         if websocket.client_state == websockets.protocol.State.OPEN:
-             await websocket.close(code=1000)
+            await websocket.close(code=1000)
 
 # --- Helper Functions --- 
 async def frontend_message_processor(websocket: WebSocket, callback):
@@ -621,6 +618,23 @@ async def debug_key_format():
     }
     
     return JSONResponse(content=results)
+
+# --- NEW HELPER FUNCTION --- 
+async def send_transcript_to_frontend(websocket: WebSocket, sender: str, text: str):
+    """Sends a transcript line to the connected frontend client."""
+    try:
+        if websocket.client_state == websockets.protocol.State.OPEN:
+            message = {
+                "event": "transcript",
+                "sender": sender, # "User" or "AI"
+                "text": text
+            }
+            logger.info(f"Sending transcript to frontend: {sender}: {text}")
+            await websocket.send_json(message)
+        else:
+            logger.warning("Attempted to send transcript to closed frontend WebSocket")
+    except Exception as e:
+        logger.error(f"Error sending transcript to frontend: {e}")
 
 if __name__ == "__main__":
     import uvicorn
