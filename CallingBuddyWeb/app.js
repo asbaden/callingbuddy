@@ -75,7 +75,11 @@ document.addEventListener('DOMContentLoaded', function() {
         buttonText.textContent = 'Processing...';
         resultDiv.classList.add('hidden');
         
-        log(`Initiating call to: ${formattedNumber}`);
+        // Get call type from the selection (assuming dropdown/radio with id="callTypeSelect")
+        const callTypeElement = document.getElementById('callTypeSelect');
+        const callType = callTypeElement ? callTypeElement.value : 'morning'; // Default to morning if not found
+
+        log(`Initiating ${callType} call to: ${formattedNumber}`);
         log(`Sending request to: ${BACKEND_URL}/call-user`);
         
         try {
@@ -84,7 +88,10 @@ document.addEventListener('DOMContentLoaded', function() {
                 headers: {
                     'Content-Type': 'application/json',
                 },
-                body: JSON.stringify({ to: formattedNumber })
+                body: JSON.stringify({ 
+                    phone_number: formattedNumber, 
+                    call_type: callType 
+                })
             });
             
             log(`Received status: ${response.status}`);
