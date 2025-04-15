@@ -3,17 +3,17 @@ document.addEventListener('DOMContentLoaded', function() {
     const BACKEND_URL = 'https://callingbuddy.onrender.com';
     
     // Get DOM elements
-    const phoneNumberInput = document.getElementById('phoneNumber');
+    // const phoneNumberInput = document.getElementById('phoneNumber'); // REMOVED
     const callButton = document.getElementById('callButton');
-    const buttonText = callButton.querySelector('.btn-text');
-    const spinner = callButton.querySelector('.spinner');
+    const buttonText = callButton.querySelector('#buttonText'); // Use # for ID selector
+    const spinner = callButton.querySelector('#spinner');    // Use # for ID selector
     const resultDiv = document.getElementById('result');
-    const logsDiv = document.getElementById('logs');
+    const logsOutput = document.getElementById('logsOutput'); // Corrected log output ID
     const transcriptArea = document.getElementById('transcriptArea');
     const transcriptOutput = document.getElementById('transcriptOutput');
     
     // Initialize
-    phoneNumberInput.focus();
+    // phoneNumberInput.focus(); // REMOVED
     
     // Add event listener for the call button
     callButton.addEventListener('click', initiateCall);
@@ -32,8 +32,8 @@ document.addEventListener('DOMContentLoaded', function() {
             
         logEntry.innerHTML = `<span class="timestamp">[${timestamp}]</span> ${formattedMessage}`;
         
-        logsDiv.appendChild(logEntry);
-        logsDiv.scrollTop = logsDiv.scrollHeight;
+        logsOutput.appendChild(logEntry);
+        logsOutput.scrollTop = logsOutput.scrollHeight;
         
         // Also log to console
         console.log(`[${timestamp}] ${message}`);
