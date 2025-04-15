@@ -302,7 +302,7 @@ async def handle_media_stream(websocket: WebSocket):
         async def send_to_twilio():
             """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
             nonlocal stream_sid, full_transcription, websocket_closed
-            current_ai_message = "" # Accumulate delta messages
+            current_ai_speech_transcript = "" # Accumulate AI speech transcript deltas
             try:
                 async for openai_message in openai_ws:
                     response = json.loads(openai_message)
@@ -310,26 +310,27 @@ async def handle_media_stream(websocket: WebSocket):
                     # Log all response types - better for debugging
                     logger.info(f"OpenAI event: {response['type']}")
                     
-                    # --- Capture AI Text --- 
-                    # Accumulate text deltas
-                    if response['type'] == 'response.text.delta' and 'delta' in response:
+                    # --- Capture AI Speech Transcription --- 
+                    # Accumulate AI speech transcript deltas
+                    if response['type'] == 'response.audio_transcript.delta' and 'delta' in response:
                         delta = response.get('delta', '')
-                        logger.info(f"AI RESPONSE (text.delta): '{delta}'")
+                        logger.info(f"AI SPEECH TRANSCRIPT (delta): '{delta}'")
                         if delta:
-                            current_ai_message += delta
+                            current_ai_speech_transcript += delta
                     
-                    # Finalize AI message when done
-                    elif response['type'] == 'response.text.done' and current_ai_message:
-                        logger.info(f"AI RESPONSE COMPLETED: '{current_ai_message}'")
-                        if current_ai_message.strip(): # Avoid adding empty messages
-                            full_transcription.append(f"AI: {current_ai_message.strip()}")
-                        current_ai_message = "" # Reset accumulator
+                    # Finalize AI speech transcript when done
+                    elif response['type'] == 'response.audio_transcript.done' and current_ai_speech_transcript:
+                        final_transcript = response.get('transcript', current_ai_speech_transcript).strip()
+                        logger.info(f"AI SPEECH TRANSCRIPT COMPLETED: '{final_transcript}'")
+                        if final_transcript: # Avoid adding empty messages
+                            full_transcription.append(f"AI: {final_transcript}")
+                        current_ai_speech_transcript = "" # Reset accumulator
 
-                    # --- Capture User Text --- 
-                    # User transcription from input audio buffer event
-                    elif response['type'] == 'input_audio_buffer.transcript' and 'transcript' in response:
+                    # --- Capture User Speech Transcription --- 
+                    # Use the completed event for user speech transcription
+                    elif response['type'] == 'conversation.item.input_audio_transcription.completed' and 'transcript' in response:
                         transcript = response.get('transcript', '')
-                        logger.info(f"USER TRANSCRIPT: '{transcript}'")
+                        logger.info(f"USER TRANSCRIPT (completed): '{transcript}'")
                         
                         if transcript and transcript.strip(): # Avoid adding empty messages
                             # Filter common noise/short utterances if needed
