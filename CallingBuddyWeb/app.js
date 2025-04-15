@@ -56,6 +56,8 @@ document.addEventListener('DOMContentLoaded', function() {
     }
     
     let websocket = null; // Global variable to hold the WebSocket instance
+    let mediaRecorder = null; // To hold the MediaRecorder instance
+    let audioStream = null; // To hold the microphone audio stream
 
     // Initiate call
     async function initiateCall() {
@@ -150,22 +152,49 @@ document.addEventListener('DOMContentLoaded', function() {
         // Remove finally block resetting button - handled in success/error/close cases
     }
     
-    // --- NEW FUNCTION: WebSocket Handling --- 
+    // --- WebSocket Handling --- 
     function startWebSocketSession(callRecordId) {
-        const wsUrl = `${BACKEND_URL}/media-stream?call_record_id=${callRecordId}`;
+        // Replace BACKEND_URL with WEBSOCKET_URL derivation
+        let wsBackendUrl = BACKEND_URL.replace(/^http/, 'ws');
+        const wsUrl = `${wsBackendUrl}/media-stream?call_record_id=${callRecordId}`;
         log(`Connecting WebSocket to: ${wsUrl}`);
         
         if (websocket && websocket.readyState === WebSocket.OPEN) {
             log('WebSocket already open. Closing previous connection.');
             websocket.close();
         }
+        if (mediaRecorder && mediaRecorder.state === 'recording') {
+            mediaRecorder.stop();
+            log('Stopped previous media recorder.');
+        }
+        if (audioStream) {
+            audioStream.getTracks().forEach(track => track.stop());
+            log('Stopped previous audio stream tracks.');
+        }
 
         websocket = new WebSocket(wsUrl);
 
-        websocket.onopen = (event) => {
+        websocket.onopen = async (event) => { // Make onopen async
             log('WebSocket connection established.');
             showResult('Connected to AI. Session active.');
-            // TODO: Start microphone capture here
+            
+            // --- START MICROPHONE CAPTURE --- 
+            try {
+                log('Requesting microphone access...');
+                audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                log('Microphone access granted.');
+                
+                // TODO: Initialize MediaRecorder and start sending audio
+                
+            } catch (err) {
+                log(`Error getting microphone access: ${err.name} - ${err.message}`);
+                showResult(`Microphone access denied or unavailable: ${err.message}`, false);
+                // Close WebSocket if mic access fails?
+                if (websocket && websocket.readyState === WebSocket.OPEN) {
+                    websocket.close(1008, "Microphone access failed");
+                }
+            }
+            // --- END MICROPHONE CAPTURE --- 
         };
 
         websocket.onmessage = (event) => {
@@ -192,6 +221,15 @@ document.addEventListener('DOMContentLoaded', function() {
         websocket.onerror = (event) => {
             log(`WebSocket Error: ${JSON.stringify(event)}`);
             showResult('WebSocket connection error.', false);
+            // Clean up audio stream on error too
+            if (audioStream) {
+                audioStream.getTracks().forEach(track => track.stop());
+                audioStream = null;
+            }
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                mediaRecorder.stop();
+                mediaRecorder = null;
+            }
             // Reset button state on error
             callButton.disabled = false;
             spinner.classList.add('hidden');
@@ -200,13 +238,25 @@ document.addEventListener('DOMContentLoaded', function() {
 
         websocket.onclose = (event) => {
             log(`WebSocket connection closed. Code: ${event.code}, Reason: ${event.reason}`);
-            showResult(`Session ended (Code: ${event.code})`, !event.wasClean);
+            showResult(`Session ended (Code: ${event.code})`, event.code !== 1000 && event.code !== 1005);
             websocket = null; // Clear the global variable
+            
+            // --- STOP MICROPHONE CAPTURE --- 
+            log('Stopping microphone capture due to WebSocket close.');
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                mediaRecorder.stop();
+                mediaRecorder = null;
+            }
+            if (audioStream) {
+                audioStream.getTracks().forEach(track => track.stop());
+                audioStream = null;
+            }
+            // --- END STOP MICROPHONE --- 
+            
             // Reset button state on close
             callButton.disabled = false;
             spinner.classList.add('hidden');
             buttonText.textContent = 'Get AI Call';
-            // TODO: Stop microphone capture here
         };
     }
     
