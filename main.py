@@ -154,35 +154,60 @@ EVENING_QUESTIONS = [
     "Thanks for sharing honestly. Taking this time to reflect is a huge part of the process. Get some rest, and I'll connect with you in the morning."
 ]
 
+# --- CONSTANTS ---
+TEST_USER_PHONE = "+10000000000" # Define a placeholder phone for the test user
+
 @app.get("/", response_class=JSONResponse)
 async def index_page():
     return {"message": "Twilio Media Stream Server is running!"}
 
 @app.post("/call-user")
 async def call_user(request_body: CallUserRequest):
-    """Initiates a virtual call session for testing (no user association)."""
+    """Initiates a virtual call session for testing, using a placeholder user."""
     call_type = request_body.call_type
-    logger.info(f"Initiating VIRTUAL {call_type} session (Test User)")
+    logger.info(f"Initiating VIRTUAL {call_type} session (Test User Mode)")
     
-    # --- REMOVE USER LOOKUP/CREATION ---
-    # user = await get_user_by_phone(phone_number)
-    # if not user:
-    #     user = await create_user(phone=phone_number) 
-    #     logger.info(f"Created new user with ID: {user['id']}")
-    # else:
-    #     logger.info(f"Found existing user with phone {phone_number}")
-    # For testing, we'll use a null or placeholder user ID
-    test_user_id = None 
+    # --- Use or Create a Test User --- 
+    test_user_id = None
+    try:
+        test_user = await get_user_by_phone(TEST_USER_PHONE)
+        if not test_user:
+            logger.info(f"Creating placeholder test user ({TEST_USER_PHONE})...")
+            test_user = await create_user(phone=TEST_USER_PHONE, name="Test User") 
+            if test_user and test_user.get('id') != "dummy-user-id": # Check if creation was real
+                 logger.info(f"Created test user with ID: {test_user['id']}")
+                 test_user_id = test_user['id']
+            else:
+                 logger.error(f"Failed to create placeholder test user.")
+                 # Handle error - perhaps raise exception or return error response?
+                 raise Exception("Failed to create necessary test user record")
+        else:
+            logger.info(f"Found existing test user with ID: {test_user['id']}")
+            test_user_id = test_user['id']
+            
+        if not test_user_id:
+             raise Exception("Could not obtain a valid ID for the test user.")
+             
+    except Exception as user_err:
+        logger.error(f"Error getting or creating test user: {user_err}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": "Failed to set up test user for session."}) 
+    # --- End Test User Logic --- 
         
     # Create a call record to track the session
     try:
         call = await create_call(
-            user_id=test_user_id, # Use null/placeholder ID
+            user_id=test_user_id, # Use the valid test user ID
             status='session_initiated', 
             call_type=call_type 
         )
+        # Check if call creation actually succeeded (might return None on DB error)
+        if not call:
+             logger.error("Failed to create call record in database (create_call returned None).")
+             # Try to get more details if possible from logs
+             raise Exception("Database operation failed during call creation.")
+             
         call_record_id = call['id']
-        logger.info(f"Created call record with ID {call_record_id} (Test User)")
+        logger.info(f"Created call record with ID {call_record_id} for Test User {test_user_id}")
 
         # Store minimal mapping info needed for WebSocket context
         call_mapping['call_id_to_info'] = call_mapping.get('call_id_to_info', {}) # Ensure exists
@@ -193,7 +218,7 @@ async def call_user(request_body: CallUserRequest):
         }
         logger.info(f"Stored session info for call record ID {call_record_id}")
         
-        # Return the call_record_id needed by the frontend to connect WebSocket
+        # Return the real call_record_id needed by the frontend
         return {
             "message": f"Virtual {call_type.capitalize()} session initiated (Test User)", 
             "call_record_id": call_record_id
@@ -202,9 +227,11 @@ async def call_user(request_body: CallUserRequest):
     except Exception as e:
         logger.error(f"Error creating call record or mapping: {e}", exc_info=True)
         # Attempt to update status to failed if call record was created
-        if 'call_record_id' in locals():
+        # Use the ID obtained *before* the exception, if available
+        call_id_to_update = locals().get('call_record_id', None)
+        if call_id_to_update:
            try: 
-               await update_call(call_id=call_record_id, status='failed')
+               await update_call(call_id=call_id_to_update, status='failed')
            except Exception as update_err:
                logger.error(f"Failed to update call status to failed: {update_err}")
         return JSONResponse(status_code=500, content={"error": f"Failed to initiate virtual session: {str(e)}"}) 
