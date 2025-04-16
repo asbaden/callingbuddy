@@ -368,11 +368,28 @@ async def handle_media_stream(websocket: WebSocket, call_record_id: str = None):
     finally:
         # Final cleanup and saving
         logger.info(f"WebSocket session ending for call_record_id: {call_record_id}")
+        # Check which task finished first if possible (difficult with wait)
+        if frontend_task.done() and not openai_task.done():
+            logger.info("Frontend task finished first.")
+        elif openai_task.done() and not frontend_task.done():
+             logger.info("OpenAI task finished first.")
+        else:
+             logger.info("Both tasks finished concurrently or main loop exited.")
+             
         save_final_transcription(full_transcription, call_record_id, call_mapping)
-        if openai_ws and openai_ws.open:
-            await openai_ws.close()
-        if websocket.client_state == websockets.protocol.State.OPEN:
-            await websocket.close(code=1000)
+        # Ensure websockets are closed even if errors occurred
+        try:
+            if openai_ws and openai_ws.open:
+                await openai_ws.close()
+                logger.info("Closed OpenAI WebSocket in finally block.")
+        except Exception as ws_close_err:
+            logger.error(f"Error closing OpenAI WS in finally: {ws_close_err}")
+        try:
+            if websocket.client_state == websockets.protocol.State.OPEN:
+                await websocket.close(code=1000)
+                logger.info("Closed Frontend WebSocket in finally block.")
+        except Exception as ws_close_err:
+             logger.error(f"Error closing Frontend WS in finally: {ws_close_err}")
 
 # --- Helper Functions --- 
 async def frontend_message_processor(websocket: WebSocket, callback):
@@ -389,11 +406,24 @@ async def openai_response_processor(openai_ws: websockets.WebSocketClientProtoco
     """Handles receiving messages from OpenAI."""
     try:
         async for message in openai_ws:
-            await callback(json.loads(message))
-    except websockets.exceptions.ConnectionClosedOK:
-        logger.info("OpenAI WebSocket closed normally.")
+            try:
+                # Log raw message for deep debugging if needed
+                # logger.debug(f"RAW OpenAI Message: {message}") 
+                response_data = json.loads(message)
+                await callback(response_data)
+            except json.JSONDecodeError as json_err:
+                logger.error(f"JSON Decode Error processing OpenAI message: {json_err}")
+                logger.error(f"Offending message snippet: {message[:500]}") # Log beginning of bad message
+            except Exception as callback_err:
+                # Log errors that happen *inside* the process_openai_response function
+                logger.error(f"Error in process_openai_response callback: {callback_err}", exc_info=True)
+    except websockets.exceptions.ConnectionClosed as close_err:
+        # Log specific close codes and reasons
+        logger.warning(f"OpenAI WebSocket closed. Code: {close_err.code}, Reason: {close_err.reason}")
     except Exception as e:
-        logger.error(f"Error receiving from OpenAI: {e}")
+        logger.error(f"Unhandled error in openai_response_processor loop: {e}", exc_info=True)
+    finally:
+        logger.info("openai_response_processor task finished.")
 
 async def ask_next_question(openai_ws, call_type, index):
     """Instructs the AI to ask the next question in the sequence."""
