@@ -303,7 +303,11 @@ async def handle_media_stream(websocket: WebSocket, call_record_id: str = None):
                     if final_transcript:
                         message = f"AI: {final_transcript}"
                         full_transcription.append(message)
-                        await send_transcript_to_frontend(websocket, "AI", final_transcript)
+                        # Check state BEFORE sending
+                        if websocket.client_state == websockets.protocol.State.OPEN:
+                            await send_transcript_to_frontend(websocket, "AI", final_transcript)
+                        else:
+                            logger.warning("Frontend WS closed before sending AI transcript.")
                     current_ai_speech_transcript = "" # Reset accumulator
                 
                 # --- Capture User Speech Transcription --- 
@@ -319,7 +323,11 @@ async def handle_media_stream(websocket: WebSocket, call_record_id: str = None):
                             message = f"User: {message_text}"
                             full_transcription.append(message)
                             logger.info(f"Added user message: '{message}'")
-                            await send_transcript_to_frontend(websocket, "User", message_text)
+                            # Check state BEFORE sending
+                            if websocket.client_state == websockets.protocol.State.OPEN:
+                                await send_transcript_to_frontend(websocket, "User", message_text)
+                            else:
+                                logger.warning("Frontend WS closed before sending User transcript.")
                             
                             # User has answered, move to next question
                             awaiting_answer = False 
@@ -332,7 +340,12 @@ async def handle_media_stream(websocket: WebSocket, call_record_id: str = None):
                     audio_b64 = response_data['delta']
                     # logger.debug("Sending audio chunk to frontend") # Can be too verbose
                     audio_message = {"event": "audio", "audio": audio_b64}
-                    await websocket.send_json(audio_message)
+                    # Check state BEFORE sending
+                    if websocket.client_state == websockets.protocol.State.OPEN:
+                        # logger.debug("Sending audio chunk to frontend") 
+                        await websocket.send_json(audio_message)
+                    else:
+                        logger.warning("Frontend WS closed before sending audio chunk.")
                 
                 # --- Other Events --- 
                 elif response_data['type'] == 'session.updated':
@@ -351,12 +364,27 @@ async def handle_media_stream(websocket: WebSocket, call_record_id: str = None):
             frontend_task = asyncio.create_task(frontend_message_processor(websocket, process_frontend_message))
             openai_task = asyncio.create_task(openai_response_processor(openai_ws, process_openai_response))
             
+            # Wait for EITHER task to complete (e.g., one side disconnects or errors)
             done, pending = await asyncio.wait(
                 [frontend_task, openai_task],
-                return_when=asyncio.FIRST_COMPLETED
+                return_when=asyncio.FIRST_COMPLETED # Keep this, completion means something ended
             )
             
+            # Log which task completed
+            for task in done:
+                if task == frontend_task:
+                    logger.info("Frontend message processor task completed.")
+                elif task == openai_task:
+                    logger.info("OpenAI response processor task completed.")
+                try:
+                    # Raise exceptions if tasks failed
+                    task.result()
+                except Exception as task_exc:
+                    logger.error(f"Task completed with error: {task_exc}", exc_info=True)
+            
+            # Cancel the other task forcefully
             for task in pending:
+                logger.info("Cancelling pending task.")
                 task.cancel()
                 try: await task
                 except asyncio.CancelledError: pass
@@ -393,14 +421,22 @@ async def handle_media_stream(websocket: WebSocket, call_record_id: str = None):
 
 # --- Helper Functions --- 
 async def frontend_message_processor(websocket: WebSocket, callback):
-    """Handles receiving messages from Frontend WebSocket."""
+    """Handles receiving messages from Frontend WebSocket. Runs until disconnect/error."""
     try:
-        async for message in websocket.iter_text():
+        # This loop will run indefinitely until the connection closes or an error occurs.
+        while websocket.client_state == websockets.protocol.State.OPEN:
+            message = await websocket.receive_text() # Wait for a message
+            logger.debug(f"Received message from frontend: {message[:100]}...") # Log received message
             await callback(json.loads(message))
-    except WebSocketDisconnect:
-        logger.info("Frontend WebSocket disconnected.")
+    except websockets.exceptions.ConnectionClosedOK:
+        logger.info("Frontend WebSocket disconnected normally (ClosedOK).")
+    except websockets.exceptions.ConnectionClosedError as close_err:
+         logger.warning(f"Frontend WebSocket closed with error. Code: {close_err.code}, Reason: {close_err.reason}")
     except Exception as e:
-        logger.error(f"Error receiving from Frontend: {e}")
+        # Log errors occurring in this specific task loop
+        logger.error(f"Error in frontend_message_processor loop: {e}", exc_info=True)
+    finally:
+         logger.info("frontend_message_processor task finished.") # Log when this task exits
 
 async def openai_response_processor(openai_ws: websockets.WebSocketClientProtocol, callback):
     """Handles receiving messages from OpenAI."""
