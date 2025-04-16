@@ -173,7 +173,7 @@ async def call_user(request_body: CallUserRequest):
         test_user = await get_user_by_phone(TEST_USER_PHONE)
         if not test_user:
             logger.info(f"Creating placeholder test user ({TEST_USER_PHONE})...")
-            test_user = await create_user(phone=TEST_USER_PHONE, name="Test User") 
+            test_user = await create_user(phone_number=TEST_USER_PHONE, name="Test User") 
             if test_user and test_user.get('id') != "dummy-user-id": # Check if creation was real
                  logger.info(f"Created test user with ID: {test_user['id']}")
                  test_user_id = test_user['id']
