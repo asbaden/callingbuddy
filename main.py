@@ -432,12 +432,9 @@ async def ask_next_question(openai_ws, call_type, index):
         question = MORNING_QUESTIONS[index]
     elif call_type == "evening" and index < len(EVENING_QUESTIONS):
         question = EVENING_QUESTIONS[index]
-        # TODO: Inject morning context for specific evening questions later
     
     if question:
         logger.info(f"Asking AI to pose question {index+1} ({call_type}): '{question}'")
-        # Send a message to OpenAI to make it speak the question
-        # We use conversation.item.create to inject an assistant message asking the question
         create_item_event = {
             "type": "conversation.item.create",
             "item": {
@@ -449,16 +446,20 @@ async def ask_next_question(openai_ws, call_type, index):
                 }]
             }
         }
+        # Explicitly trigger response generation
+        response_create_event = {"type": "response.create"}
+        
         try:
+            # Send instruction to add the question to context
             await openai_ws.send(json.dumps(create_item_event))
-            # Optionally trigger response immediately if desired, or let AI handle it
-            # response_create_event = {"type": "response.create"} 
-            # await openai_ws.send(json.dumps(response_create_event))
+            # Immediately ask AI to generate response (speak the question)
+            logger.info("Sending response.create to trigger AI speech")
+            await openai_ws.send(json.dumps(response_create_event))
         except Exception as e:
-            logger.error(f"Error sending question instruction to OpenAI: {e}")
+            logger.error(f"Error sending question/response trigger to OpenAI: {e}")
     else:
         logger.info(f"Reached end of {call_type} questions.")
-        # Optionally send a concluding message or close the call
+        # TODO: Optionally send a concluding message or close the call
 
 def save_final_transcription(transcription_list, call_record_id, call_mapping):
     """Saves the final transcription list to file and database using call_record_id."""
