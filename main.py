@@ -423,20 +423,40 @@ async def handle_media_stream(websocket: WebSocket, call_record_id: str = None):
 async def frontend_message_processor(websocket: WebSocket, callback):
     """Handles receiving messages from Frontend WebSocket. Runs until disconnect/error."""
     try:
-        # This loop will run indefinitely until the connection closes or an error occurs.
+        # Loop indefinitely while the connection is open
         while websocket.client_state == websockets.protocol.State.OPEN:
-            message = await websocket.receive_text() # Wait for a message
-            logger.debug(f"Received message from frontend: {message[:100]}...") # Log received message
-            await callback(json.loads(message))
+            try:
+                # Wait for a message with a timeout (e.g., 1 second)
+                # This prevents blocking forever if no messages arrive but keeps the task alive.
+                message = await asyncio.wait_for(websocket.receive_text(), timeout=1.0)
+                logger.debug(f"Received message from frontend: {message[:100]}...")
+                await callback(json.loads(message))
+            except asyncio.TimeoutError:
+                # No message received, just continue looping
+                # logger.debug("No message from frontend, still listening...")
+                continue
+            except websockets.exceptions.ConnectionClosed:
+                # Handle explicit close within the loop if wait_for doesn't catch it first
+                logger.info("Frontend WebSocket closed during receive.")
+                break # Exit the loop cleanly
+            except json.JSONDecodeError as json_err:
+                 logger.error(f"JSON Decode Error processing Frontend message: {json_err}")
+                 logger.error(f"Offending frontend message snippet: {message[:500]}")
+            except Exception as inner_e:
+                 # Catch errors within the loop's try block
+                 logger.error(f"Error processing frontend message: {inner_e}", exc_info=True)
+                 # Decide if we should break or continue based on error type
+                 # For now, let's continue unless it's fatal
+
     except websockets.exceptions.ConnectionClosedOK:
         logger.info("Frontend WebSocket disconnected normally (ClosedOK).")
     except websockets.exceptions.ConnectionClosedError as close_err:
-         logger.warning(f"Frontend WebSocket closed with error. Code: {close_err.code}, Reason: {close_err.reason}")
+        logger.warning(f"Frontend WebSocket closed with error. Code: {close_err.code}, Reason: {close_err.reason}")
     except Exception as e:
-        # Log errors occurring in this specific task loop
-        logger.error(f"Error in frontend_message_processor loop: {e}", exc_info=True)
+        # Catch errors occurring outside the main loop (e.g., during initial setup)
+        logger.error(f"Error in frontend_message_processor task: {e}", exc_info=True)
     finally:
-         logger.info("frontend_message_processor task finished.") # Log when this task exits
+        logger.info("frontend_message_processor task finished.")
 
 async def openai_response_processor(openai_ws: websockets.WebSocketClientProtocol, callback):
     """Handles receiving messages from OpenAI."""
